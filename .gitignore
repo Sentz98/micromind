@@ -130,6 +130,7 @@ dmypy.json
 
 output/
 results/
+data/
 ckp/
 checkpoints/
 *.swp
