@@ -27,6 +27,10 @@ from micromind.networks import PhiNet, XiNet
 from micromind.utils import parse_configuration
 import sys
 
+from micromind.utils.helpers import get_logger
+import wandb
+
+logger = get_logger()
 
 class ImageClassification(mm.MicroMind):
     """Implements an image classification class. Provides support
@@ -179,6 +183,9 @@ if __name__ == "__main__":
     assert len(sys.argv) > 1, "Please pass the configuration file to the script."
     hparams = parse_configuration(sys.argv[1])
 
+    #get logger level
+    logger.level(hparams.log_level)
+
     train_loader, val_loader = create_loaders(hparams)
 
     exp_folder = mm.utils.checkpointer.create_experiment_folder(
@@ -189,9 +196,21 @@ if __name__ == "__main__":
         exp_folder, hparams=hparams, key="loss"
     )
 
+    # start a new wandb run to track this script
+    if hparams.wandb_log:
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project=hparams.experiment_name,
+            name= hparams.wandb_name,
+
+            # resume a run if it exists
+            # id = hparams.wandb_id,
+            # resume=hparams.wandb_resume,
+        )
+
     mind = ImageClassification(hparams=hparams)
 
-    top1 = mm.Metric("top1_acc", top_k_accuracy(k=1), eval_only=True)
+    top1 = mm.Metric("top1_acc", top_k_accuracy(k=1), eval_only=False)
     top5 = mm.Metric("top5_acc", top_k_accuracy(k=5), eval_only=True)
 
     mind.train(
@@ -200,6 +219,43 @@ if __name__ == "__main__":
         metrics=[top5, top1],
         checkpointer=checkpointer,
         debug=hparams.debug,
+        qat=hparams.quantize and (hparams.quantizer == "QAT" or hparams.quantizer == "DIFFQ"),
     )
 
     mind.test(datasets={"test": val_loader}, metrics=[top1, top5])
+
+    if hparams.quantize and hparams.quantizer == "PTQ":
+        logger.info("Quantizing the model with PTQ")
+        from micromind.utils.quantizer import fuse_modules, inject_quant
+        import torch.ao.quantization as tq
+
+        layers_types2 = (nn.Conv2d, nn.BatchNorm2d)
+        mind.modules = fuse_modules(mind.modules, layers_types2)
+        
+        # add quant and dequant layers
+
+        inject_quant(mind.modules["classifier"])
+
+        # # Check the fused model
+        mind.device = 'cpu'
+        mind.modules = mind.modules.to(mind.device)
+
+
+        # #insert the observer in the model
+        mind.modules.qconfig = tq.default_qconfig
+        tq.prepare(mind.modules, inplace=True)
+
+        
+        #define a
+        logger.info("Calibrating the quantizer")
+        mind.test(datasets={"test": train_loader}, metrics=[top1, top5])
+
+        # # quantize the model
+        model_int8 = tq.convert(mind.modules, inplace=False)
+        mind.modules = model_int8
+        mind.device = 'cpu'
+        mind.modules = mind.modules.to(mind.device)
+
+        mind.test(datasets={"test": val_loader}, metrics=[top1, top5])
+    
+

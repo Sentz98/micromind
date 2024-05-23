@@ -21,6 +21,9 @@ import warnings
 from .utils.helpers import get_logger
 from .utils.checkpointer import Checkpointer
 
+from diffq import DiffQuantizer, UniformQuantizer
+import wandb
+
 logger = get_logger()
 
 # This is used ONLY if you are not using argparse to get the hparams
@@ -411,6 +414,31 @@ class MicroMind(ABC):
                 please check https://micromind-toolkit.github.io/docs/").
             """
             warnings.warn(" ".join(tmp.split()))
+        
+        # initialize the quantizer
+        if self.hparams.quantize and self.hparams.quantizer == "DIFFQ":
+            self.quantizer = DiffQuantizer(
+                self.modules, group_size=self.hparams.q_group_size,
+                min_size=self.hparams.q_min_size,
+                min_bits=self.hparams.q_min_bits,
+                init_bits=self.hparams.q_init_bits,
+                max_bits=self.hparams.q_max_bits,
+                exclude=self.hparams.q_exclude)
+            if self.hparams.quant.adam:
+                self.quantizer.opt = torch.optim.Adam([{"params": []}])
+                self.quantizer.setup_optimizer(self.quantizer.opt, lr=self.hparams.q_lr)
+            else:
+                self.quantizer.setup_optimizer(self.opt, lr=self.hparams.q_lr)
+            
+            logger.info(f"DiffQ quantizer initialized with the following parameters:{self.hparams.q_group_size}, {self.hparams.q_min_size}, {self.hparams.q_min_bits}, {self.hparams.q_init_bits}, {self.hparams.q_max_bits}, {self.hparams.q_exclude}")
+        elif self.hparams.quantize and self.hparams.quantizer == "PTQ":
+            self.quantizer = UniformQuantizer(
+                self.modules, min_size=self.hparams.q_min_size,
+                bits=self.hparams.q_bits, qat=self.hparams.q_qat, exclude=self.hparams.q_exclude)
+        else:
+            self.quantizer = None
+        
+
 
     def init_devices(self):
         """Initializes the data pipeline and modules for DDP and accelerated inference.
@@ -461,6 +489,7 @@ class MicroMind(ABC):
         metrics: List[Metric] = [],
         checkpointer: Optional[Checkpointer] = None,
         debug: Optional[bool] = False,
+        qat: Optional[bool] = False,
     ) -> None:
         """
         This method trains the model on the provided training dataset for the
@@ -484,6 +513,8 @@ class MicroMind(ABC):
             Whether to run in debug mode. Default is False. If in debug mode,
             only runs for few epochs
             and with few batches.
+        qat : bool
+            Whether to run in quantization-aware training mode. Default is False.
         """
         self.datasets = datasets
         self.metrics = metrics
@@ -522,6 +553,13 @@ class MicroMind(ABC):
                 with self.accelerator.autocast():
                     model_out = self(batch)
                     loss = self.compute_loss(model_out, batch)
+
+                    # DiffQ penalty
+                    model_size = self.quantizer.model_size() if self.quantizer else 0
+                    #TODO modifica sto schifo e logga la model size
+                    if self.quantizer and self.penalty > 0:
+                        loss = loss + self.penalty * model_size
+
                     loss_epoch += loss.item()
 
                 self.accelerator.backward(loss)
@@ -561,6 +599,10 @@ class MicroMind(ABC):
 
             train_metrics.update({"train_loss": loss_epoch / (idx + 1)})
 
+            # log model size
+            if self.quantizer is not None:
+                train_metrics.update({"model_size": self.quantizer.true_model_size()})
+
             if "val" in datasets:
                 val_metrics = self.validate()
                 if (
@@ -574,6 +616,12 @@ class MicroMind(ABC):
                     )
             else:
                 val_metrics = train_metrics.update({"val_loss": loss_epoch / (idx + 1)})
+            
+            # Log to wandb
+            if self.hparams.wandb_log:
+                wandb.log(train_metrics)
+                wandb.log(val_metrics)
+                
 
             if e >= 1 and self.debug:
                 break

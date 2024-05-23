@@ -271,7 +271,7 @@ class SeparableConv2d(torch.nn.Module):
     out_channels : int
         Output number of channels.
     activation : function, optional
-        Activation function to apply (default is torch.nn.functional.relu).
+        Activation function to apply (default is torch.nn.ReLU).
     kernel_size : int, optional
         Kernel size (default is 3).
     stride : int, optional
@@ -293,7 +293,7 @@ class SeparableConv2d(torch.nn.Module):
         self,
         in_channels,
         out_channels,
-        activation=torch.nn.functional.relu,
+        activation=torch.nn.ReLU(),
         kernel_size=3,
         stride=1,
         padding=0,
