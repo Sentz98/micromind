@@ -32,6 +32,7 @@ import wandb
 
 logger = get_logger()
 
+
 class ImageClassification(mm.MicroMind):
     """Implements an image classification class. Provides support
     for timm augmentation and loss functions."""
@@ -183,7 +184,7 @@ if __name__ == "__main__":
     assert len(sys.argv) > 1, "Please pass the configuration file to the script."
     hparams = parse_configuration(sys.argv[1])
 
-    #get logger level
+    # get logger level
     logger.level(hparams.log_level)
 
     train_loader, val_loader = create_loaders(hparams)
@@ -201,8 +202,7 @@ if __name__ == "__main__":
         wandb.init(
             # set the wandb project where this run will be logged
             project=hparams.experiment_name,
-            name= hparams.wandb_name,
-
+            name=hparams.wandb_name,
             # resume a run if it exists
             # id = hparams.wandb_id,
             # resume=hparams.wandb_resume,
@@ -219,7 +219,8 @@ if __name__ == "__main__":
         metrics=[top5, top1],
         checkpointer=checkpointer,
         debug=hparams.debug,
-        qat=hparams.quantize and (hparams.quantizer == "QAT" or hparams.quantizer == "DIFFQ"),
+        qat=hparams.quantize
+        and (hparams.quantizer == "QAT" or hparams.quantizer == "DIFFQ"),
     )
 
     mind.test(datasets={"test": val_loader}, metrics=[top1, top5])
@@ -231,31 +232,27 @@ if __name__ == "__main__":
 
         layers_types2 = (nn.Conv2d, nn.BatchNorm2d)
         mind.modules = fuse_modules(mind.modules, layers_types2)
-        
+
         # add quant and dequant layers
 
         inject_quant(mind.modules["classifier"])
 
         # # Check the fused model
-        mind.device = 'cpu'
+        mind.device = "cpu"
         mind.modules = mind.modules.to(mind.device)
-
 
         # #insert the observer in the model
         mind.modules.qconfig = tq.default_qconfig
         tq.prepare(mind.modules, inplace=True)
 
-        
-        #define a
+        # define a
         logger.info("Calibrating the quantizer")
         mind.test(datasets={"test": train_loader}, metrics=[top1, top5])
 
         # # quantize the model
         model_int8 = tq.convert(mind.modules, inplace=False)
         mind.modules = model_int8
-        mind.device = 'cpu'
+        mind.device = "cpu"
         mind.modules = mind.modules.to(mind.device)
 
         mind.test(datasets={"test": val_loader}, metrics=[top1, top5])
-    
-
