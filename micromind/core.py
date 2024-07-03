@@ -21,18 +21,18 @@ import warnings
 from .utils.helpers import get_logger
 from .utils.checkpointer import Checkpointer
 
-from diffq import DiffQuantizer, UniformQuantizer
-import wandb
-
 logger = get_logger()
 
 # This is used ONLY if you are not using argparse to get the hparams
 default_cfg = {
+    "project_name": "micromind",
     "output_folder": "results",
     "experiment_name": "micromind_exp",
     "opt": "adam",  # this is ignored if you are overriding the configure_optimizers
     "lr": 0.001,  # this is ignored if you are overriding the configure_optimizers
     "debug": False,
+    "log_wandb": False,
+    "wandb_resume": "auto",  # ["allow", "must", "never", "auto" or None]
 }
 
 
@@ -392,6 +392,17 @@ class MicroMind(ABC):
         # pass debug status to checkpointer
         self.checkpointer.debug = self.hparams.debug
 
+        if self.hparams.log_wandb:
+            import wandb
+
+            self.wlog = wandb.init(
+                project=self.hparams.project_name,
+                name=self.hparams.experiment_name,
+                resume=self.hparams.wandb_resume,
+                id=self.hparams.experiment_name,
+                config=self.hparams,
+            )
+
         init_opt = self.configure_optimizers()
         if isinstance(init_opt, list) or isinstance(init_opt, tuple):
             self.opt, self.lr_sched = init_opt
@@ -416,25 +427,39 @@ class MicroMind(ABC):
             warnings.warn(" ".join(tmp.split()))
         
         # initialize the quantizer
-        if self.hparams.quantize and self.hparams.quantizer == "DIFFQ":
-            self.quantizer = DiffQuantizer(
-                self.modules, group_size=self.hparams.q_group_size,
-                min_size=self.hparams.q_min_size,
-                min_bits=self.hparams.q_min_bits,
-                init_bits=self.hparams.q_init_bits,
-                max_bits=self.hparams.q_max_bits,
-                exclude=self.hparams.q_exclude)
-            if self.hparams.quant.adam:
-                self.quantizer.opt = torch.optim.Adam([{"params": []}])
-                self.quantizer.setup_optimizer(self.quantizer.opt, lr=self.hparams.q_lr)
-            else:
-                self.quantizer.setup_optimizer(self.opt, lr=self.hparams.q_lr)
+        if self.hparams.quantize:
+            if self.hparams.quantizer == "DIFFQ":
+                from diffq import DiffQuantizer
+                self.quantizer = DiffQuantizer(
+                    self.modules, group_size=self.hparams.q_group_size,
+                    min_size=self.hparams.q_min_size,
+                    min_bits=self.hparams.q_min_bits,
+                    init_bits=self.hparams.q_init_bits,
+                    max_bits=self.hparams.q_max_bits,
+                    exclude=self.hparams.q_exclude)
+                if self.hparams.quant.adam:
+                    self.quantizer.opt = torch.optim.Adam([{"params": []}])
+                    self.quantizer.setup_optimizer(self.quantizer.opt, lr=self.hparams.q_lr)
+                else:
+                    self.quantizer.setup_optimizer(self.opt, lr=self.hparams.q_lr)
+                
+                logger.info(f"DiffQ quantizer initialized with the following parameters:
+                            {self.hparams.q_group_size}, 
+                            {self.hparams.q_min_size}, 
+                            {self.hparams.q_min_bits}, 
+                            {self.hparams.q_init_bits}, 
+                            {self.hparams.q_max_bits}, 
+                            {self.hparams.q_exclude}")
+                
+            elif self.hparams.quantizer == "PTQ":
+                from diffq import UniformQuantizer
+                
+                self.quantizer = UniformQuantizer(
+                    self.modules, min_size=self.hparams.q_min_size,
+                    bits=self.hparams.q_bits, qat=self.hparams.q_qat, exclude=self.hparams.q_exclude)
             
-            logger.info(f"DiffQ quantizer initialized with the following parameters:{self.hparams.q_group_size}, {self.hparams.q_min_size}, {self.hparams.q_min_bits}, {self.hparams.q_init_bits}, {self.hparams.q_max_bits}, {self.hparams.q_exclude}")
-        elif self.hparams.quantize and self.hparams.quantizer == "PTQ":
-            self.quantizer = UniformQuantizer(
-                self.modules, min_size=self.hparams.q_min_size,
-                bits=self.hparams.q_bits, qat=self.hparams.q_qat, exclude=self.hparams.q_exclude)
+            else:
+                raise ValueError(f"Quantizer {self.hparams.quantizer} not supported.")
         else:
             self.quantizer = None
         
@@ -477,6 +502,8 @@ class MicroMind(ABC):
 
     def on_train_end(self):
         """Runs at the end of each training. Cleans up before exiting."""
+        if self.hparams.log_wandb:
+            self.wlog.finish()
         pass
 
     def eval(self):
@@ -570,6 +597,9 @@ class MicroMind(ABC):
                     # ok for cos_lr
                     self.lr_sched.step()
 
+                    if self.hparams.log_wandb:
+                        self.wlog.log({"lr": self.lr_sched.get_last_lr()})
+
                 for m in self.metrics:
                     if (
                         self.current_epoch + 1
@@ -602,7 +632,7 @@ class MicroMind(ABC):
             # log model size
             if self.quantizer is not None:
                 train_metrics.update({"model_size": self.quantizer.true_model_size()})
-
+            
             if "val" in datasets:
                 val_metrics = self.validate()
                 if (
@@ -616,11 +646,11 @@ class MicroMind(ABC):
                     )
             else:
                 val_metrics = train_metrics.update({"val_loss": loss_epoch / (idx + 1)})
-            
+                       
             # Log to wandb
-            if self.hparams.wandb_log:
-                wandb.log(train_metrics)
-                wandb.log(val_metrics)
+            if self.hparams.log_wandb:
+                self.wlog.log(train_metrics)
+                self.wlog.log(val_metrics)
                 
 
             if e >= 1 and self.debug:

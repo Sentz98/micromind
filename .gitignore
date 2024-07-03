@@ -134,8 +134,8 @@ data/
 ckp/
 checkpoints/
 *.swp
+wandb/
 
 Dockerfile
 build_dgx.sh
 run_dgx.sh
-wandb/

@@ -10,8 +10,8 @@ model = "phinet"
 input_shape = (3, 32, 32)
 alpha = 3
 num_layers = 7
-beta = 0.75
-t_zero = 6
+beta = 1
+t_zero = 5
 divisor = 8
 downsampling_layers = [5, 7]
 return_layers = None
@@ -26,14 +26,6 @@ data_dir = "data/cifar10/"
 dataset = "torch/cifar10"
 batch_size = 256
 dataset_download = True
-experiment_name = "test_diffq"
-
-# Logging
-log_level = "INFO"
-wandb_log = True
-wandb_name = "test_diffq"
-wandb_id = 0000
-wandb_resume = True
 
 # Dataloading config
 num_workers = 4
@@ -46,7 +38,7 @@ bce_target_thresh = None
 
 # Quantization config
 quantize = True
-quantizer = "DIFFQ" # PTQ, QAT, or DIFFQ
+quantizer = "DIFFQ"  # PTQ, QAT, or DIFFQ
 
 
 q_min_size: 0.01  # minimum param size in MB to be quantized
@@ -56,7 +48,7 @@ q_group_size: 8  # group size for DiffQ
 q_min_bits: 2  # minimal number of bits for DiffQ
 q_init_bits: 8  # initial number of bits for DiffQ
 q_max_bits: 15  # max number of bits for DiffQ
-#q_exclude: []  # exclude patterns, e.g. bias
+# q_exclude: []  # exclude patterns, e.g. bias
 q_qat: False  # quantization aware training to be used with uniform qunatization
 q_lr: 1e-3  # learning rate for the bits parameters
 q_adam: True  # use a separate optimizer for the bits parameters
