@@ -430,16 +430,21 @@ class MicroMind(ABC):
         if self.hparams.quantize:
             if self.hparams.quantizer == "DIFFQ":
                 from diffq import DiffQuantizer
+
                 self.quantizer = DiffQuantizer(
-                    self.modules, group_size=self.hparams.q_group_size,
+                    self.modules,
+                    group_size=self.hparams.q_group_size,
                     min_size=self.hparams.q_min_size,
                     min_bits=self.hparams.q_min_bits,
                     init_bits=self.hparams.q_init_bits,
                     max_bits=self.hparams.q_max_bits,
-                    exclude=self.hparams.q_exclude)
+                    exclude=self.hparams.q_exclude,
+                )
                 if self.hparams.quant.adam:
                     self.quantizer.opt = torch.optim.Adam([{"params": []}])
-                    self.quantizer.setup_optimizer(self.quantizer.opt, lr=self.hparams.q_lr)
+                    self.quantizer.setup_optimizer(
+                        self.quantizer.opt, lr=self.hparams.q_lr
+                    )
                 else:
                     self.quantizer.setup_optimizer(self.opt, lr=self.hparams.q_lr)
 
@@ -447,15 +452,17 @@ class MicroMind(ABC):
                 from diffq import UniformQuantizer
 
                 self.quantizer = UniformQuantizer(
-                    self.modules, min_size=self.hparams.q_min_size,
-                    bits=self.hparams.q_bits, qat=self.hparams.q_qat, exclude=self.hparams.q_exclude)
+                    self.modules,
+                    min_size=self.hparams.q_min_size,
+                    bits=self.hparams.q_bits,
+                    qat=self.hparams.q_qat,
+                    exclude=self.hparams.q_exclude,
+                )
 
             else:
                 raise ValueError(f"Quantizer {self.hparams.quantizer} not supported.")
         else:
             self.quantizer = None
-
-
 
     def init_devices(self):
         """Initializes the data pipeline and modules for DDP and accelerated inference.
@@ -575,7 +582,7 @@ class MicroMind(ABC):
 
                     # DiffQ penalty
                     model_size = self.quantizer.model_size() if self.quantizer else 0
-                    #TODO modifica sto schifo e logga la model size
+                    # TODO modifica sto schifo e logga la model size
                     if self.quantizer and self.penalty > 0:
                         loss = loss + self.penalty * model_size
 
@@ -643,7 +650,6 @@ class MicroMind(ABC):
             if self.hparams.log_wandb:
                 self.wlog.log(train_metrics)
                 self.wlog.log(val_metrics)
-
 
             if e >= 1 and self.debug:
                 break
