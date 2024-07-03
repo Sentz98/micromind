@@ -63,15 +63,11 @@ def print_size_of_model(model):
 
 
 def log_results(model, test_loss, test_acc_1, inference_time, test_acc_5=None):
-    print(
-        "\n========================================= PERFORMANCE ============================================="
-    )
+    print("\n" + "=" * 20 + " PERFORMANCE " + "=" * 20 + "\n")
     print_size_of_model(model)
     log_str = f"\nTest Loss: {test_loss:.3f} | Test Acc @1: {test_acc_1:6.2f}%"
     if test_acc_5:
         log_str += f"| Test Acc @5: {test_acc_5:6.2f}%"
     print(log_str)
     print("Average inference time = {:0.4f} milliseconds".format(inference_time))
-    print(
-        "===================================================================================================="
-    )
+    print("\n" + "=" * 53 + "\n")

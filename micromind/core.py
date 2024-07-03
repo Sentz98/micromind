@@ -425,7 +425,7 @@ class MicroMind(ABC):
                 please check https://micromind-toolkit.github.io/docs/").
             """
             warnings.warn(" ".join(tmp.split()))
-        
+
         # initialize the quantizer
         if self.hparams.quantize:
             if self.hparams.quantizer == "DIFFQ":
@@ -442,27 +442,19 @@ class MicroMind(ABC):
                     self.quantizer.setup_optimizer(self.quantizer.opt, lr=self.hparams.q_lr)
                 else:
                     self.quantizer.setup_optimizer(self.opt, lr=self.hparams.q_lr)
-                
-                logger.info(f"DiffQ quantizer initialized with the following parameters:
-                            {self.hparams.q_group_size}, 
-                            {self.hparams.q_min_size}, 
-                            {self.hparams.q_min_bits}, 
-                            {self.hparams.q_init_bits}, 
-                            {self.hparams.q_max_bits}, 
-                            {self.hparams.q_exclude}")
-                
+
             elif self.hparams.quantizer == "PTQ":
                 from diffq import UniformQuantizer
-                
+
                 self.quantizer = UniformQuantizer(
                     self.modules, min_size=self.hparams.q_min_size,
                     bits=self.hparams.q_bits, qat=self.hparams.q_qat, exclude=self.hparams.q_exclude)
-            
+
             else:
                 raise ValueError(f"Quantizer {self.hparams.quantizer} not supported.")
         else:
             self.quantizer = None
-        
+
 
 
     def init_devices(self):
@@ -632,7 +624,7 @@ class MicroMind(ABC):
             # log model size
             if self.quantizer is not None:
                 train_metrics.update({"model_size": self.quantizer.true_model_size()})
-            
+
             if "val" in datasets:
                 val_metrics = self.validate()
                 if (
@@ -646,12 +638,12 @@ class MicroMind(ABC):
                     )
             else:
                 val_metrics = train_metrics.update({"val_loss": loss_epoch / (idx + 1)})
-                       
+
             # Log to wandb
             if self.hparams.log_wandb:
                 self.wlog.log(train_metrics)
                 self.wlog.log(val_metrics)
-                
+
 
             if e >= 1 and self.debug:
                 break
