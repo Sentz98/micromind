@@ -42,7 +42,10 @@ class ImageClassification(mm.MicroMind):
                 num_layers=hparams.num_layers,
                 beta=hparams.beta,
                 t_zero=hparams.t_zero,
-                compatibility=False,
+                compatibility=True,
+                conv2d_input = True,
+                squeeze_excite =False,
+                h_swish = False,
                 divisor=hparams.divisor,
                 downsampling_layers=hparams.downsampling_layers,
                 return_layers=hparams.return_layers,
@@ -69,6 +72,9 @@ class ImageClassification(mm.MicroMind):
 
         print("Number of MAC for each module:")
         print(self.compute_macs(hparams.input_shape))
+
+        print("Float model size:")
+        print(self.compute_model_size())
 
     def setup_criterion(self):
         """Setup of the loss function based on augmentation strategy."""
@@ -203,3 +209,10 @@ if __name__ == "__main__":
     )
 
     mind.test(datasets={"test": val_loader}, metrics=[top1, top5])
+    
+    from micromind.quantize import quantize_pt
+
+    quantize_pt(mind, 'classifier',"", train_loader, val_loader, [top1, top5], max_cal=20)
+
+    #mind.pt_quantize(datasets={"test": val_loader}, metrics=[top1, top5])
+        

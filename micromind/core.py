@@ -43,6 +43,7 @@ class Stage:
     train: int = 0
     val: int = 1
     test: int = 2
+    quantize: int = 3
 
 
 class Metric:
@@ -381,6 +382,27 @@ class MicroMind(ABC):
             macs = None
 
         return macs
+     
+    def compute_model_size(self, round_to=2):
+        """
+        Computes the model size in MB for the modules inside `self.modules`.
+        Returns a dictionary with the model size for each module.
+
+        Parameters
+        ----------
+        round_to : int, optional
+            The number of decimal places to round the results to (default is 2).
+
+        Returns
+        -------
+        dict
+            Model size for self.modules in MB, rounded to the specified number of decimal places.
+        """
+        def par2MB(v):
+            return v * 4 / (1024 ** 2)
+
+        # Apply the operation to each element in the dictionary and round the results
+        return {k: round(par2MB(v), round_to) for k, v in self.compute_params().items()}
 
     def on_train_start(self):
         """Initializes the optimizer, modules and puts the networks on the right
@@ -411,6 +433,50 @@ class MicroMind(ABC):
 
         self.init_devices()
 
+        # initialize the quantizer
+        if self.hparams.quantize: 
+            try:
+                from diffq import DiffQuantizer, UniformQuantizer
+            except ImportError:
+                print("Did you install diffq?")
+                pass
+            if self.hparams.quantizer == "DIFFQ":
+                self.quantizer = DiffQuantizer(
+                    self.modules, 
+                    group_size=self.hparams.q_group_size,
+                    min_size=self.hparams.q_min_size,
+                    min_bits=self.hparams.q_min_bits,
+                    init_bits=self.hparams.q_init_bits,
+                    max_bits=self.hparams.q_max_bits,
+                    exclude=self.hparams.q_exclude)
+                self.penalty = self.hparams.q_penalty
+
+                opt_quant = self.opt
+                if self.hparams.q_adam:
+                    self.quantizer.opt = torch.optim.Adam([{"params": []}])
+                    opt_quant = self.quantizer.opt
+
+                self.quantizer.setup_optimizer(opt_quant, lr=self.hparams.q_lr) # it's adding the quant params here
+                
+                logger.info(f"DiffQ QUANTIZER = Penalty {self.hparams.q_penalty}| Group size {self.hparams.q_group_size}| Min size {self.hparams.q_min_size}| Min bits {self.hparams.q_min_bits}| Init bits {self.hparams.q_init_bits}| Max bits {self.hparams.q_max_bits}| Exclude {self.hparams.q_exclude}")
+                logger.info(f"DiffQ OPTIMIZER = Adam {self.hparams.q_adam}| LR {self.hparams.q_lr}")
+        
+            elif self.hparams.quantizer == "QAT":    
+                self.quantizer = UniformQuantizer(
+                    self.modules, 
+                    min_size=self.hparams.q_min_size,
+                    bits=self.hparams.q_bits, 
+                    qat=self.hparams.q_qat, 
+                    exclude=self.hparams.q_exclude)
+                self.penalty=0
+                
+                logger.info(f"QAT QUANTIZER = Min size {self.hparams.q_min_size}| Bits {self.hparams.q_bits}| QAT {self.hparams.q_qat}| Exclude {self.hparams.q_exclude}")
+            
+            else:
+                raise NameError(f"{self.hparams.quantizer} is not a valid quantizer (QAT, DIFFQ)")                
+        else:
+            self.quantizer = None
+
         self.start_epoch = 0
         if self.checkpointer is not None:
             # recover state
@@ -418,6 +484,7 @@ class MicroMind(ABC):
             if ckpt is not None:
                 accelerate_path, self.start_epoch = ckpt
                 self.accelerator.load_state(accelerate_path)
+                #TODO devo fare il loader per i checkpoint del modello quantizzato
         else:
             tmp = """
                 You are not passing a checkpointer to the training function, \
@@ -425,44 +492,6 @@ class MicroMind(ABC):
                 please check https://micromind-toolkit.github.io/docs/").
             """
             warnings.warn(" ".join(tmp.split()))
-
-        # initialize the quantizer
-        if self.hparams.quantize:
-            if self.hparams.quantizer == "DIFFQ":
-                from diffq import DiffQuantizer
-
-                self.quantizer = DiffQuantizer(
-                    self.modules,
-                    group_size=self.hparams.q_group_size,
-                    min_size=self.hparams.q_min_size,
-                    min_bits=self.hparams.q_min_bits,
-                    init_bits=self.hparams.q_init_bits,
-                    max_bits=self.hparams.q_max_bits,
-                    exclude=self.hparams.q_exclude,
-                )
-                if self.hparams.quant.adam:
-                    self.quantizer.opt = torch.optim.Adam([{"params": []}])
-                    self.quantizer.setup_optimizer(
-                        self.quantizer.opt, lr=self.hparams.q_lr
-                    )
-                else:
-                    self.quantizer.setup_optimizer(self.opt, lr=self.hparams.q_lr)
-
-            elif self.hparams.quantizer == "PTQ":
-                from diffq import UniformQuantizer
-
-                self.quantizer = UniformQuantizer(
-                    self.modules,
-                    min_size=self.hparams.q_min_size,
-                    bits=self.hparams.q_bits,
-                    qat=self.hparams.q_qat,
-                    exclude=self.hparams.q_exclude,
-                )
-
-            else:
-                raise ValueError(f"Quantizer {self.hparams.quantizer} not supported.")
-        else:
-            self.quantizer = None
 
     def init_devices(self):
         """Initializes the data pipeline and modules for DDP and accelerated inference.
@@ -515,7 +544,6 @@ class MicroMind(ABC):
         metrics: List[Metric] = [],
         checkpointer: Optional[Checkpointer] = None,
         debug: Optional[bool] = False,
-        qat: Optional[bool] = False,
     ) -> None:
         """
         This method trains the model on the provided training dataset for the
@@ -539,8 +567,6 @@ class MicroMind(ABC):
             Whether to run in debug mode. Default is False. If in debug mode,
             only runs for few epochs
             and with few batches.
-        qat : bool
-            Whether to run in quantization-aware training mode. Default is False.
         """
         self.datasets = datasets
         self.metrics = metrics
@@ -575,21 +601,24 @@ class MicroMind(ABC):
                     batch = [b.to(self.device) for b in batch]
 
                 self.opt.zero_grad()
+                if self.quantizer and hasattr(self.quantizer, 'opt'):
+                    self.quantizer.opt.zero_grad()
 
                 with self.accelerator.autocast():
                     model_out = self(batch)
                     loss = self.compute_loss(model_out, batch)
 
                     # DiffQ penalty
-                    model_size = self.quantizer.model_size() if self.quantizer else 0
-                    # TODO modifica sto schifo e logga la model size
-                    if self.quantizer and self.penalty > 0:
+                    if self.hparams.quantize and self.hparams.quantizer == "DIFFQ" and self.penalty > 0:
+                        model_size = self.quantizer.model_size() if self.quantizer else 0
                         loss = loss + self.penalty * model_size
 
                     loss_epoch += loss.item()
 
                 self.accelerator.backward(loss)
                 self.opt.step()
+                if self.quantizer and hasattr(self.quantizer, 'opt'):
+                    self.quantizer.opt.step()
 
                 loss_epoch += loss.item()
                 if hasattr(self, "lr_sched"):
@@ -719,7 +748,14 @@ class MicroMind(ABC):
         Metrics computed on test set. : Dict[torch.Tensor]
         """
         assert "test" in datasets, "Test dataloader was not specified."
-        self.modules.eval()
+
+        for module in self.modules:
+            if isinstance(self.modules[module], torch.fx.GraphModule):
+                torch.ao.quantization.move_exported_model_to_eval(self.modules[module])
+                print('grafo')
+            else:
+                self.modules[module].eval()
+
 
         pbar = tqdm(
             datasets["test"],
@@ -747,6 +783,10 @@ class MicroMind(ABC):
 
         test_metrics = {"test_" + m.name: m.reduce(Stage.test, True) for m in metrics}
         test_metrics.update({"test_loss": loss_epoch / (idx + 1)})
+
+        if self.quantizer is not None:
+                test_metrics.update({"model_size": self.quantizer.true_model_size()})
+                
         s_out = (
             "Testing "
             + " - ".join([f"{k}: {v:.2f}" for k, v in test_metrics.items()])
@@ -756,3 +796,49 @@ class MicroMind(ABC):
         logger.info(s_out)
 
         return test_metrics
+    
+    @torch.no_grad()
+    def pt_quantize(self, datasets: Dict = {}, metrics: List[Metric] = []) -> None:
+
+        assert "test" in datasets, "Test dataloader was not specified."
+
+
+        from torch._export import capture_pre_autograd_graph
+        from torch.ao.quantization.quantize_pt2e import (
+            prepare_pt2e,
+            prepare_qat_pt2e,
+            convert_pt2e,
+        )
+        from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+        XNNPACKQuantizer,
+        get_symmetric_quantization_config,
+        )
+
+        # Step 1. program capture model with aten ops
+        self.datasets
+        eg_input = (torch.randn(next(iter(datasets["test"]))[0].shape).to(self.device),)
+        m_cap = capture_pre_autograd_graph(self.modules['classifier'], eg_input)
+
+
+        # Step 2. quantization
+        quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config(is_per_channel=False))
+        m_p = prepare_pt2e(m_cap, quantizer)
+
+        def calibrate(model, data_loader):
+            
+            with torch.no_grad():
+                for image, _ in tqdm(data_loader):
+                    model(image.to(self.device))
+                    break
+
+        calibrate(m_p, datasets['test']) 
+
+        quantized_model = convert_pt2e(m_p, fold_quantize = False, use_reference_representation=False)
+        
+
+        self.modules['classifier'] = quantized_model
+
+
+        self.test(datasets, metrics)
+
+        print(self.modules['classifier'].print_readable())
