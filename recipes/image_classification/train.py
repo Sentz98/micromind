@@ -44,7 +44,7 @@ class ImageClassification(mm.MicroMind):
                 t_zero=hparams.t_zero,
                 compatibility=True,
                 conv2d_input = True,
-                squeeze_excite =False,
+                squeeze_excite =True,
                 h_swish = False,
                 divisor=hparams.divisor,
                 downsampling_layers=hparams.downsampling_layers,
