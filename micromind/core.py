@@ -752,7 +752,6 @@ class MicroMind(ABC):
         for module in self.modules:
             if isinstance(self.modules[module], torch.fx.GraphModule):
                 torch.ao.quantization.move_exported_model_to_eval(self.modules[module])
-                print('grafo')
             else:
                 self.modules[module].eval()
 
@@ -789,7 +788,7 @@ class MicroMind(ABC):
                 
         s_out = (
             "Testing "
-            + " - ".join([f"{k}: {v:.2f}" for k, v in test_metrics.items()])
+            + " - ".join([f"{k}: {v:.4f}" for k, v in test_metrics.items()])
             + "; "
         )
 
@@ -821,7 +820,7 @@ class MicroMind(ABC):
 
 
         # Step 2. quantization
-        quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config(is_per_channel=False))
+        quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config(is_per_channel=True))
         m_p = prepare_pt2e(m_cap, quantizer)
 
         def calibrate(model, data_loader):
@@ -841,4 +840,8 @@ class MicroMind(ABC):
 
         self.test(datasets, metrics)
 
-        print(self.modules['classifier'].print_readable())
+        from torch.fx import passes
+
+        g = passes.graph_drawer.FxGraphDrawer(self.modules['classifier'], 'aaa')
+        with open("a.svg", "wb") as f:
+            f.write(g.get_dot_graph().create_svg())

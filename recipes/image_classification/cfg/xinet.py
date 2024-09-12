@@ -33,6 +33,10 @@ persistent_workers = True
 bce_loss = False
 bce_target_thresh = None
 
+# Quantization config
+quantize = False
+quantizer = "DIFFQ"  # PTQ, QAT, or DIFFQ
+
 # Data augmentation config
 aa = "rand-m8-inc1-mstd101"
 aug_repeats = 0

@@ -217,6 +217,17 @@ def remove_depthwise(model):
                 if isinstance(layer, DepthwiseConv2d):
                     module._layers[i] = convert_to_conv2d(layer)
 
+def replace_silu_with_relu(model):
+        # Recursively replace all instances of nn.SiLU with nn.ReLU
+        for name, module in model.named_children():
+            # If the module itself contains children, apply the function recursively
+            replace_silu_with_relu(module)
+            
+            # If the module is SiLU, replace it with ReLU
+            if isinstance(module, nn.SiLU):
+                setattr(model, name, nn.ReLU())
+                
+
 def get_input_shape(dataloader):
     for inputs, _ in dataloader:
         if isinstance(inputs, tuple):
@@ -266,7 +277,7 @@ def quantize_pt(
         rtol=1e-03, 
         atol=1e-06, 
         num_tests=10, 
-        input_size=(1,3,224,224)), "Fused model is not equivalent to the original model!"
+        input_size=input_shape), "Fused model is not equivalent to the original model!"
     
 
     # add quant and dequant layers
@@ -276,8 +287,12 @@ def quantize_pt(
     mind.modules = mind.modules.to(mind.device)
 
     # #insert the observer in the model
-    mind.modules.qconfig = tq.get_default_qconfig("x86")
+    qconf = tq.get_default_qconfig("qnnpack")
+    mind.modules.qconfig = qconf
+
     tq.prepare(mind.modules, inplace=True)
+
+    print(mind.modules)
 
     # calibrate
     logger.info("Calibrating the quantizer")
