@@ -797,21 +797,19 @@ class MicroMind(ABC):
         return test_metrics
     
     @torch.no_grad()
-    def pt_quantize(self, datasets: Dict = {}, metrics: List[Metric] = []) -> None:
+    def pt_quantize(self, backend = 'x86', per_channel = True, datasets: Dict = {}, metrics: List[Metric] = []) -> None:
 
         assert "test" in datasets, "Test dataloader was not specified."
 
+        self.device = 'cpu'
+        self.modules['classifier'].to(self.device)
 
         from torch._export import capture_pre_autograd_graph
         from torch.ao.quantization.quantize_pt2e import (
             prepare_pt2e,
-            prepare_qat_pt2e,
             convert_pt2e,
         )
-        from torch.ao.quantization.quantizer.xnnpack_quantizer import (
-        XNNPACKQuantizer,
-        get_symmetric_quantization_config,
-        )
+        
 
         # Step 1. program capture model with aten ops
         self.datasets
@@ -820,7 +818,22 @@ class MicroMind(ABC):
 
 
         # Step 2. quantization
-        quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config(is_per_channel=True))
+        if backend == 'xnnpack':
+            from torch.ao.quantization.quantizer.xnnpack_quantizer import (
+                XNNPACKQuantizer,
+                get_symmetric_quantization_config,
+            )
+
+            quantizer = XNNPACKQuantizer().set_global(get_symmetric_quantization_config(is_per_channel=per_channel))
+
+        elif backend == 'x86':
+            import torch.ao.quantization.quantizer.x86_inductor_quantizer as xiq
+            from torch.ao.quantization.quantizer.x86_inductor_quantizer import X86InductorQuantizer
+
+            quantizer = X86InductorQuantizer()
+            quantizer.set_global(xiq.get_default_x86_inductor_quantization_config())
+        
+        
         m_p = prepare_pt2e(m_cap, quantizer)
 
         def calibrate(model, data_loader):
@@ -828,20 +841,31 @@ class MicroMind(ABC):
             with torch.no_grad():
                 for image, _ in tqdm(data_loader):
                     model(image.to(self.device))
-                    break
 
         calibrate(m_p, datasets['test']) 
 
-        quantized_model = convert_pt2e(m_p, fold_quantize = False, use_reference_representation=False)
+        quantized_model = convert_pt2e(m_p, fold_quantize = True, use_reference_representation=False)
         
 
         self.modules['classifier'] = quantized_model
 
-
         self.test(datasets, metrics)
 
-        from torch.fx import passes
+        # from torch.fx import passes
 
-        g = passes.graph_drawer.FxGraphDrawer(self.modules['classifier'], 'aaa')
-        with open("a.svg", "wb") as f:
-            f.write(g.get_dot_graph().create_svg())
+        # g = passes.graph_drawer.FxGraphDrawer(self.modules['classifier'], 'aaa')
+        # with open("a.svg", "wb") as f:
+        #     f.write(g.get_dot_graph().create_svg())
+
+        # Optional: using the C++ wrapper instead of default Python wrapper
+        import torch._inductor.config as config
+        config.cpp_wrapper = True
+
+        with torch.no_grad():
+            optimized_model = torch.compile(quantized_model)
+            optimized_model.to('cpu')
+
+        # Running some benchmark
+        print(optimized_model(*eg_input))
+
+        print(optimized_model)

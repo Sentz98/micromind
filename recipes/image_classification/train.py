@@ -212,7 +212,7 @@ if __name__ == "__main__":
     
     from micromind.quantize import quantize_pt
 
-    quantize_pt(mind, 'classifier',"", train_loader, val_loader, [top1, top5], max_cal=20)
+    #quantize_pt(mind, 'classifier',"", train_loader, val_loader, [top1, top5], max_cal=20)
 
-    #mind.pt_quantize(datasets={"test": val_loader}, metrics=[top1, top5])
+    mind.pt_quantize(backend='x86', datasets={"test": val_loader}, metrics=[top1, top5])
         

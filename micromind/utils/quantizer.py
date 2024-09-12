@@ -1,6 +1,8 @@
 import os
 import torch
 import torch.ao.quantization as tq
+import time 
+import numpy as np
 
 
 def find_layers_in_order(model, layer_types):
@@ -55,19 +57,93 @@ def inject_quant(model):
     bound_forward = forward_injected.__get__(model, model.__class__)
     setattr(model.__class__, "forward", bound_forward)
 
-
 def print_size_of_model(model):
+    """
+    Print the size of the model.
+    """
     torch.save(model.state_dict(), "temp.p")
-    print("Size of the model(MB):", os.path.getsize("temp.p") / 1e6)
-    os.remove("temp.p")
+    size_in_bytes = os.path.getsize("temp.p")
+    if size_in_bytes < 1048576:
+        size_in_kb = size_in_bytes / 1024
+        print("{:.3f} KB".format(size_in_kb))
+    else:
+        size_in_mb = size_in_bytes / 1048576
+        print("{:.3f} MB".format(size_in_mb))
+    os.remove('temp.p')
 
+def measure_inference_latency(model, input_shape, device = None, repetitions=100, warmup_it = 10):
+    """
+    Measures the inference time of the provided neural mindwork model.
 
-def log_results(model, test_loss, test_acc_1, inference_time, test_acc_5=None):
-    print("\n" + "=" * 20 + " PERFORMANCE " + "=" * 20 + "\n")
-    print_size_of_model(model)
-    log_str = f"\nTest Loss: {test_loss:.3f} | Test Acc @1: {test_acc_1:6.2f}%"
-    if test_acc_5:
-        log_str += f"| Test Acc @5: {test_acc_5:6.2f}%"
-    print(log_str)
-    print("Average inference time = {:0.4f} milliseconds".format(inference_time))
-    print("\n" + "=" * 53 + "\n")
+    Args:
+        model: The neural mindwork model to evaluate.
+        input_shape: The shape of the input data expected by the model.
+
+    Returns:
+        tuple: A tuple containing the mean and standard deviation of the inference time
+               measured in milliseconds.
+    """
+    if device is None:
+        device = next(model.parameters()).device.type  # Get the device where the model is located
+    
+    if len(input_shape) == 4:
+        # Remove the batch
+        input_shape = input_shape[1:]
+    
+    dummy_input = torch.randn(1, *input_shape, dtype=torch.float).to(device)
+    
+    # Set model to evaluation mode
+    model.to(device)
+    model.eval()
+    
+    # GPU warm-up
+    for _ in range(warmup_it):
+        _ = model(dummy_input)
+
+    # Measure inference time
+    timings = []
+    with torch.no_grad():
+        if device == 'cuda':
+            starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            for rep in range(repetitions):
+                starter.record()
+                _ = model(dummy_input)
+                ender.record()
+                torch.cuda.synchronize()
+                curr_time = starter.elapsed_time(ender)
+                timings.append(curr_time)
+        else:  # CPU
+            for rep in range(repetitions):
+                start_time = time.time()
+                _ = model(dummy_input)
+                end_time = time.time()
+                elapsed_time = (end_time - start_time) * 1000.0  # Convert to milliseconds
+                timings.append(elapsed_time)
+
+    # Calculate mean and std
+    mean_time = np.mean(timings)
+    std_time = np.std(timings)
+
+    return mean_time, std_time
+
+def model_equivalence(model_1, model_2, device, rtol=1e-05, atol=1e-08, num_tests=100, input_size=(1,3,32,32), verbose=False):
+    """
+    Tests whether two models are equivalent by comparing their outputs on random inputs.
+    """
+
+    model_1.to(device)
+    model_2.to(device)
+
+    for i in range(num_tests):
+        print(f"Running test {i+1}/{num_tests}") if verbose else None
+        x = torch.rand(size=input_size).to(device)
+        y1 = model_1(x).detach().cpu().numpy()
+        y2 = model_2(x).detach().cpu().numpy()
+        print("Difference: ", np.max(np.abs(y1-y2))) if verbose else None
+        if np.allclose(a=y1, b=y2, rtol=rtol, atol=atol, equal_nan=False) == False:
+            print("Model equivalence test sample failed: ")
+            print(y1)
+            print(y2)
+            return False
+    print("Model equivalence test passed!")
+    return True
