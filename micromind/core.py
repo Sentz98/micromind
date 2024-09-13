@@ -804,15 +804,14 @@ class MicroMind(ABC):
         self.device = 'cpu'
         self.modules['classifier'].to(self.device)
 
+
         from torch._export import capture_pre_autograd_graph
         from torch.ao.quantization.quantize_pt2e import (
             prepare_pt2e,
             convert_pt2e,
         )
-        
 
         # Step 1. program capture model with aten ops
-        self.datasets
         eg_input = (torch.randn(next(iter(datasets["test"]))[0].shape).to(self.device),)
         m_cap = capture_pre_autograd_graph(self.modules['classifier'], eg_input)
 
@@ -844,28 +843,16 @@ class MicroMind(ABC):
 
         calibrate(m_p, datasets['test']) 
 
-        quantized_model = convert_pt2e(m_p, fold_quantize = True, use_reference_representation=False)
+        # print(m_p.graph.print_tabular())
+
+        quantized_model = convert_pt2e(m_p, fold_quantize = True, use_reference_representation=True)
+
+        quantized_model.print_readable()
         
 
         self.modules['classifier'] = quantized_model
 
         self.test(datasets, metrics)
 
-        # from torch.fx import passes
-
-        # g = passes.graph_drawer.FxGraphDrawer(self.modules['classifier'], 'aaa')
-        # with open("a.svg", "wb") as f:
-        #     f.write(g.get_dot_graph().create_svg())
-
-        # Optional: using the C++ wrapper instead of default Python wrapper
-        import torch._inductor.config as config
-        config.cpp_wrapper = True
-
-        with torch.no_grad():
-            optimized_model = torch.compile(quantized_model)
-            optimized_model.to('cpu')
-
-        # Running some benchmark
-        print(optimized_model(*eg_input))
-
-        print(optimized_model)
+        ep = torch.export.export(quantized_model, eg_input)
+        torch.export.save(ep, 'quantized_model.qt')
