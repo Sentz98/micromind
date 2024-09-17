@@ -71,18 +71,7 @@ def remove_depthwise(model):
         if isinstance(module, PhiNetConvBlock):
             for i, layer in enumerate(module._layers.children()):
                 if isinstance(layer, DepthwiseConv2d):
-                    module._layers[i] = convert_to_conv2d(layer)
-
-def replace_silu_with_relu(model):
-        # Recursively replace all instances of nn.SiLU with nn.ReLU
-        for name, module in model.named_children():
-            # If the module itself contains children, apply the function recursively
-            replace_silu_with_relu(module)
-            
-            # If the module is SiLU, replace it with ReLU
-            if isinstance(module, nn.SiLU):
-                setattr(model, name, nn.ReLU())
-                
+                    module._layers[i] = convert_to_conv2d(layer)               
 
 def get_input_shape(dataloader):
     for inputs, _ in dataloader:
@@ -148,7 +137,7 @@ def quantize_pt(
 
     tq.prepare(mind.modules, inplace=True)
 
-    print(mind.modules)
+    #print(mind.modules)
 
     # calibrate
     logger.info("Calibrating the quantizer")
@@ -157,9 +146,10 @@ def quantize_pt(
             _ = mind(inputs) 
             if i >= max_cal:  
                 break
-              
+            
     # quantize the model
     tq.convert(mind.modules, inplace=True)
+    print(mind.modules)
 
 
     # # Save the quantized model
@@ -178,8 +168,8 @@ def quantize_pt(
     print("INT8 size:")
     qutil.print_size_of_model(mind.modules[module])
 
-    fp32_cpu_inference_latency  = qutil.measure_inference_latency(model_fp32, device ="cpu", input_shape=(256,3,32,32))
-    int8_cpu_inference_latency  = qutil.measure_inference_latency(mind.modules[module], device ="cpu", input_shape=(256,3,32,32))
+    fp32_cpu_inference_latency  = qutil.measure_inference_latency(model_fp32, device ="cpu", input_shape=input_shape)
+    int8_cpu_inference_latency  = qutil.measure_inference_latency(mind.modules[module], device ="cpu", input_shape=input_shape)
 
     print("FP32 CPU Inference Latency: {:.3f} ms".format(fp32_cpu_inference_latency[0]))
     print("INT8 CPU Inference Latency: {:.3f} ms".format(int8_cpu_inference_latency[0]))

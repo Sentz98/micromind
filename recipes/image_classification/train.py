@@ -200,6 +200,20 @@ if __name__ == "__main__":
     top1 = mm.Metric("top1_acc", top_k_accuracy(k=1), eval_only=True)
     top5 = mm.Metric("top5_acc", top_k_accuracy(k=5), eval_only=True)
 
+    if hparams.model == 'xinet' and hparams.remove_silu:
+        def replace_silu_with_relu(model):
+            # Recursively replace all instances of nn.SiLU with nn.ReLU
+            for name, module in model.named_children():
+                # If the module itself contains children, apply the function recursively
+                replace_silu_with_relu(module)
+                
+                # If the module is SiLU, replace it with ReLU
+                if isinstance(module, nn.SiLU):
+                    setattr(model, name, nn.ReLU())
+        
+        replace_silu_with_relu(mind.modules)
+
+    #print(mind.modules)
     mind.train(
         epochs=hparams.epochs,
         datasets={"train": train_loader, "val": val_loader},
@@ -212,7 +226,7 @@ if __name__ == "__main__":
     
     from micromind.quantize import quantize_pt
 
-    #quantize_pt(mind, 'classifier',"", train_loader, val_loader, [top1, top5], max_cal=20)
+    quantize_pt(mind, 'classifier',"", train_loader, val_loader, [top1, top5], max_cal=20)
 
-    mind.pt_quantize(backend='x86', datasets={"test": val_loader}, metrics=[top1, top5])
+    #mind.pt_quantize(backend='x86', datasets={"test": val_loader}, metrics=[top1, top5])
         

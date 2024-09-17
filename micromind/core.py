@@ -442,7 +442,7 @@ class MicroMind(ABC):
                 pass
             if self.hparams.quantizer == "DIFFQ":
                 self.quantizer = DiffQuantizer(
-                    self.modules, 
+                    self.modules['classifier'], 
                     group_size=self.hparams.q_group_size,
                     min_size=self.hparams.q_min_size,
                     min_bits=self.hparams.q_min_bits,
@@ -463,7 +463,7 @@ class MicroMind(ABC):
         
             elif self.hparams.quantizer == "QAT":    
                 self.quantizer = UniformQuantizer(
-                    self.modules, 
+                    self.modules['classifier'], 
                     min_size=self.hparams.q_min_size,
                     bits=self.hparams.q_bits, 
                     qat=self.hparams.q_qat, 
@@ -690,7 +690,8 @@ class MicroMind(ABC):
     def validate(self) -> Dict:
         """Runs the validation step."""
         assert "val" in self.datasets, "Validation dataloader was not specified."
-        self.modules.eval()
+        for module in self.modules:
+            self.modules[module].eval()
 
         pbar = tqdm(
             self.datasets["val"],
@@ -854,5 +855,5 @@ class MicroMind(ABC):
 
         self.test(datasets, metrics)
 
-        ep = torch.export.export(quantized_model, eg_input)
-        torch.export.save(ep, 'quantized_model.qt')
+        # ep = torch.export.export(quantized_model, eg_input)
+        # torch.export.save(ep, 'quantized_model.qt')

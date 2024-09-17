@@ -7,6 +7,7 @@ Authors:
 """
 import torch
 import torch.nn as nn
+from torch.ao.nn.quantized import FloatFunctional 
 
 from typing import Union, Tuple, Optional, List
 
@@ -100,6 +101,7 @@ class XiConv(nn.Module):
         self.pool = pool
         self.batchnorm = batchnorm
         self.dropout_rate = dropout_rate
+        self.f_add = FloatFunctional()
 
         if skip_tensor_in:
             assert skip_res is not None, "Specifcy shape of skip tensor."
@@ -158,6 +160,8 @@ class XiConv(nn.Module):
             self.bn = nn.BatchNorm2d(c_out)
         if dropout_rate > 0:
             self.do = nn.Dropout(dropout_rate)
+        if attention:
+            self.f_mul = FloatFunctional() #needed for quantization
 
     def forward(self, x: torch.Tensor):
         """Computes the forward step of the XiNet's convolutional block.
@@ -183,7 +187,7 @@ class XiConv(nn.Module):
             x = self.compression_conv(x)
 
         if s is not None:
-            x = x + s
+            x = self.f_add.add(x, s)
 
         if self.pool:
             x = self.mp(x)
@@ -201,7 +205,7 @@ class XiConv(nn.Module):
             else:
                 att_in = x
             y = self.att_act(self.att_conv(att_in))
-            x = x * y
+            x = self.f_mul.mul(x, y)
 
         if self.dropout_rate > 0:
             x = self.do(x)
