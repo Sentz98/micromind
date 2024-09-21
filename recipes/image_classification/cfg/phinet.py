@@ -6,7 +6,7 @@ Authors:
 """
 
 # Model configuration
-experiment_name = "phinet_375_cifar100"
+experiment_name = "phinet_375_cifar100_float"
 model = "phinet"
 input_shape = (3, 32, 32)
 alpha = 3
@@ -17,16 +17,24 @@ divisor = 8
 downsampling_layers = [5, 7]
 return_layers = None
 
+# Logging
+log_level = "INFO"
+wandb_log = True
+wandb_name = experiment_name
+wandb_id = 0000
+wandb_resume = True
+
 ckpt_pretrained = ""
 
 # Basic training loop
-epochs = 50
+epochs = 20
 
 # Basic data
 data_dir = "data/cifar100/"
 dataset = "torch/cifar100"
 batch_size = 256
 dataset_download = True
+calib_percentage = 30
 
 # Dataloading config
 num_workers = 4
@@ -37,20 +45,20 @@ persistent_workers = True
 bce_loss = False
 bce_target_thresh = None
 
+
 # Quantization config
 quantize = False
-quantizer = "DIFFQ"  # PTQ, QAT, or DIFFQ
+quantizer = "QAT"  #QAT, or DIFFQ
 
-
-q_min_size = 0.01  # minimum param size in MB to be quantized
-q_bits = 8  # number of bits used for uniform quantization
+q_min_size = 0.0001  # minimum param size in MB to be quantized>
+q_bits = 2  # number of bits used for uniform quantization
 q_penalty = 5  # model weight penalty for DiffQ
-q_group_size = 8  # group size for DiffQ
+q_group_size = 4  # group size for DiffQ
 q_min_bits = 2  # minimal number of bits for DiffQ
 q_init_bits = 8  # initial number of bits for DiffQ
 q_max_bits = 15  # max number of bits for DiffQ
-# q_exclude: []  # exclude patterns, e.g. bias
-q_qat = False  # quantization aware training to be used with uniform qunatization
+q_exclude = []  # exclude patterns, e.g. bias
+q_qat = True  # quantization aware training to be used with uniform qunatization
 q_lr = 1e-3  # learning rate for the bits parameters
 q_adam = True  # use a separate optimizer for the bits parameters
 q_lsq = False  # use LSQ
@@ -78,7 +86,7 @@ jsd_loss = False
 layer_decay = 0.65
 local_rank = 0
 log_interval = 50
-log_wandb = False
+log_wandb = True
 lr = 0.001
 lr_base = 0.1
 lr_base_scale = ""

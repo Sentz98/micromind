@@ -4,7 +4,6 @@ Post training pytorch eager mode quantization pipeline for micromind model.
 Authors:
     - Gabriele Santini, 2024
 """
-import os
 import copy
 from pathlib import Path
 from typing import Union
@@ -82,12 +81,12 @@ def get_input_shape(dataloader):
 @torch.no_grad()
 def quantize_pt(
     mind: Union[nn.Module, mm.MicroMind],
-    module: str,
-    save_path: Union[Path, str],
+    modules: list[str],
     calibration_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     metrics: list,
-    max_cal = 20,
+    save_path: Union[Path, str] = None,
+    verbose = False
 ) -> None:
     """ Post Training Quantization (PTQ) pipeline.
 
@@ -102,74 +101,76 @@ def quantize_pt(
     test_loader : torch.utils.data.DataLoader
         Test dataloader used for evaluation. 
     """
-    model_fp32 = copy.deepcopy(mind.modules[module])
+    modules_float = copy.deepcopy(mind.modules)
     input_shape = get_input_shape(calibration_loader)
-
-    # change depthwise
-    remove_depthwise(mind.modules[module])
-
-    mind.modules.to('cpu')
-    mind.modules.eval()
-
-    # fuse modules
-    phinet_fuse_modules(mind.modules[module])
-
-    #check model prepared
-    assert qutil.model_equivalence(
-        model_1=model_fp32,
-        model_2=mind.modules[module], 
-        device="cpu", 
-        rtol=1e-03, 
-        atol=1e-06, 
-        num_tests=10, 
-        input_size=input_shape), "Fused model is not equivalent to the original model!"
-    
-
-    # add quant and dequant layers
-    qutil.inject_quant(mind.modules[module])
 
     mind.device = "cpu" # quant operations run only on cpu
     mind.modules = mind.modules.to(mind.device)
 
-    # #insert the observer in the model
-    qconf = tq.get_default_qconfig("qnnpack")
-    mind.modules.qconfig = qconf
+    for module in modules:
+        # change depthwise
+        remove_depthwise(mind.modules[module])
+        mind.modules[module].eval()
+        # fuse modules
+        if isinstance(mind.modules[module], mm.networks.PhiNet):
+            phinet_fuse_modules(mind.modules[module])
+        #TODO ?
+        # elif isinstance(mind.modules[module], mm.networks.XiNet):
+        #     xinet_fuse_modules(mind.modules[module])
+        else:
+            l2f = [(nn.Conv2d, nn.ReLU)]
+            qutil.fuse_modules(mind.modules[module], layers_combinations=l2f, is_qat=False, inplace=True)
 
-    tq.prepare(mind.modules, inplace=True)
+        #Check the module
+        assert qutil.model_equivalence(
+            model_1=modules_float[module],
+            model_2=mind.modules[module], 
+            device="cpu", 
+            rtol=1e-03, 
+            atol=1e-06, 
+            num_tests=10, 
+            input_size=input_shape), f"Fused module {module} is not equivalent to the original module!"
 
-    #print(mind.modules)
+        # add quant and dequant layers
+        qutil.inject_quant(mind.modules[module])
 
-    # calibrate
+        qconf = tq.get_default_qconfig("qnnpack")
+        mind.modules.qconfig = qconf
+
+        tq.prepare(mind.modules, inplace=True)
+
+    # Calibrate the quantizer
     logger.info("Calibrating the quantizer")
-    with torch.no_grad(): 
-        for i,inputs in tqdm(enumerate(calibration_loader), "Calibration", total=max_cal):
-            _ = mind(inputs) 
-            if i >= max_cal:  
-                break
-            
-    # quantize the model
+    with torch.no_grad():
+        for i, inputs in enumerate(tqdm(calibration_loader, desc="Calibration")):
+            _ = mind(inputs)
+    if verbose:
+        logger.debug("Calibrated model")
+        print(mind.modules)
+
+    # Quantize the model
     tq.convert(mind.modules, inplace=True)
-    print(mind.modules)
+    if verbose:
+        logger.debug("Converted model")
+        print(mind.modules)
 
+    # Save the quantized model
+    if save_path:
+        save_path = Path(save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        torch.save(mind.modules.state_dict(), save_path.joinpath("model_int8.pt"))
 
-    # # Save the quantized model
-    save_path = Path(save_path)
-    save_path.mkdir(parents=True, exist_ok=True)
-    torch.save(mind.modules.state_dict(), save_path.joinpath("model_int8.pt"))
+        logger.info(f"Saved quantized model to {save_path}.")
 
-    logger.info(f"Saved quantized model to {save_path}.")
-
-
+    # Test the quantized model TODO SISTEMA LOG
     mind.test(datasets={"test": test_loader}, metrics=metrics)
 
-    print("FP32 size:")
-    qutil.print_size_of_model(model_fp32)
+    logger.info(f"FP32 size: {qutil.compute_model_size(modules_float)}; " 
+                +f"INT8 size: {qutil.compute_model_size(mind.modules)}")  
 
-    print("INT8 size:")
-    qutil.print_size_of_model(mind.modules[module])
-
-    fp32_cpu_inference_latency  = qutil.measure_inference_latency(model_fp32, device ="cpu", input_shape=input_shape)
-    int8_cpu_inference_latency  = qutil.measure_inference_latency(mind.modules[module], device ="cpu", input_shape=input_shape)
-
-    print("FP32 CPU Inference Latency: {:.3f} ms".format(fp32_cpu_inference_latency[0]))
-    print("INT8 CPU Inference Latency: {:.3f} ms".format(int8_cpu_inference_latency[0]))
+    for module in modules:
+        fp32_cpu_inference_latency  = qutil.measure_inference_latency(modules_float[module], device ="cpu", input_shape=input_shape)
+        int8_cpu_inference_latency  = qutil.measure_inference_latency(mind.modules[module], device ="cpu", input_shape=input_shape)
+        print(module)
+        print("FP32 CPU Inference Latency: {:.3f} ms".format(fp32_cpu_inference_latency[0]))
+        print("INT8 CPU Inference Latency: {:.3f} ms".format(int8_cpu_inference_latency[0]))

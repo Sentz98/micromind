@@ -5,31 +5,35 @@ import time
 import numpy as np
 
 
-def find_layers_in_order(model, layer_types):
+def find_layers_in_order(model, layer_combinations):
     layer_names = []
     modules = list(model.named_modules())
 
-    for i in range(len(modules)):
-        block = []
-        name, module = modules[i]
+    for layer_types in layer_combinations:
+        for i in range(len(modules)):
+            block = []
+            name, module = modules[i]
 
-        if type(module) == layer_types[0]:
-            block.append(name)
+            if type(module) == layer_types[0]:
+                block.append(name)
 
-            for j in range(1, len(layer_types)):
-                if i + 1 < len(modules):
-                    name, module = modules[i + j]
-                    if type(module) == layer_types[j]:
-                        block.append(name)
+                for j in range(1, len(layer_types)):
+                    if i + 1 < len(modules):
+                        name, module = modules[i + j]
+                        if type(module) == layer_types[j]:
+                            block.append(name)
 
-        if len(block) == len(layer_types):
-            layer_names.append(block)
+            if len(block) == len(layer_types):
+                layer_names.append(block)
 
     return layer_names
 
 
-def fuse_modules(model, layers_types, is_qat=False, inplace=False):
-    layer2fuse = find_layers_in_order(model, layers_types)
+def fuse_modules(model, layers_combinations = [(torch.nn.Conv2d, torch.nn.ReLU)], is_qat=False, inplace=False, verbose=False):
+    layer2fuse = find_layers_in_order(model, layers_combinations)
+
+    if verbose:
+        print(layer2fuse)
 
     if not is_qat:
         model.eval()
@@ -57,19 +61,20 @@ def inject_quant(model):
     bound_forward = forward_injected.__get__(model, model.__class__)
     setattr(model.__class__, "forward", bound_forward)
 
-def print_size_of_model(model):
+def compute_model_size(model) -> str:
     """
-    Print the size of the model.
+    Return the size of the model.
     """
     torch.save(model.state_dict(), "temp.p")
     size_in_bytes = os.path.getsize("temp.p")
+    os.remove('temp.p')
     if size_in_bytes < 1048576:
         size_in_kb = size_in_bytes / 1024
-        print("{:.3f} KB".format(size_in_kb))
+        return "{:.3f} KB".format(size_in_kb)
     else:
         size_in_mb = size_in_bytes / 1048576
-        print("{:.3f} MB".format(size_in_mb))
-    os.remove('temp.p')
+        return "{:.3f} MB".format(size_in_mb)
+    
 
 def measure_inference_latency(model, input_shape, device = None, repetitions=100, warmup_it = 10):
     """

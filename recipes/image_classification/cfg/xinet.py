@@ -6,6 +6,7 @@ Authors:
 """
 
 # Model configuration
+experiment_name= "xinet_cifar100_float"
 model = "xinet"
 input_shape = (3, 128, 128)
 alpha = 1
@@ -13,16 +14,19 @@ num_layers = 7
 return_layers = None
 gamma = 4
 
+remove_silu = True
+
 ckpt_pretrained = ""
 
 # Basic training loop
-epochs = 50
+epochs = 100
 
 # Basic data
-data_dir = "data/cifar10/"
-dataset = "torch/cifar10"
+data_dir = "data/cifar100/"
+dataset = "torch/cifar100"
 batch_size = 256
 dataset_download = True
+calib_percentage = 10
 
 # Dataloading config
 num_workers = 4
@@ -36,6 +40,19 @@ bce_target_thresh = None
 # Quantization config
 quantize = False
 quantizer = "DIFFQ"  # PTQ, QAT, or DIFFQ
+
+q_min_size = 0.0001  # minimum param size in MB to be quantized
+q_bits = 8  # number of bits used for uniform quantization
+q_penalty = 5  # model weight penalty for DiffQ
+q_group_size = 4  # group size for DiffQ
+q_min_bits = 2  # minimal number of bits for DiffQ
+q_init_bits = 8  # initial number of bits for DiffQ
+q_max_bits = 15  # max number of bits for DiffQ
+q_exclude = []  # exclude patterns, e.g. bias
+q_qat = True  # quantization aware training to be used with uniform qunatization
+q_lr = 1e-3  # learning rate for the bits parameters
+q_adam = True  # use a separate optimizer for the bits parameters
+q_lsq = False  # use LSQ
 
 # Data augmentation config
 aa = "rand-m8-inc1-mstd101"

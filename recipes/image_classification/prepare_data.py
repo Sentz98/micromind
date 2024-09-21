@@ -8,6 +8,7 @@ Authors:
 
 """
 import torch
+import numpy as np
 
 from timm.data import (
     AugMixDataset,
@@ -166,4 +167,16 @@ def create_loaders(args: Namespace):
         loader_args["drop_last"] = False
         loader_eval = loader_class(dataset_eval, **loader_args)
 
-    return loader_train, loader_eval
+    # Create the calibration loader (subset of the training set)
+    calib_percentage = args.calib_percentage  # e.g., 10 for 10%
+    calib_size = int(len(dataset_train) * calib_percentage / 100)
+    
+    # Get random indices for the calibration subset
+    calib_indices = np.random.choice(len(dataset_train), calib_size, replace=False)
+    dataset_calib = torch.utils.data.Subset(dataset_train, calib_indices)
+    
+    # Create loader_calib with the same loader_args but no shuffling
+    loader_args["shuffle"] = False
+    loader_calib = torch.utils.data.DataLoader(dataset_calib, **loader_args)
+
+    return loader_train, loader_calib, loader_eval

@@ -185,7 +185,7 @@ if __name__ == "__main__":
     assert len(sys.argv) > 1, "Please pass the configuration file to the script."
     hparams = parse_configuration(sys.argv[1])
 
-    train_loader, val_loader = create_loaders(hparams)
+    train_loader, calib_loader, val_loader = create_loaders(hparams)
 
     exp_folder = mm.utils.checkpointer.create_experiment_folder(
         hparams.output_folder, hparams.experiment_name
@@ -226,7 +226,7 @@ if __name__ == "__main__":
     
     from micromind.quantize import quantize_pt
 
-    quantize_pt(mind, 'classifier',"", train_loader, val_loader, [top1, top5], max_cal=20)
+    quantize_pt(mind, ['classifier'], calib_loader, val_loader, [top1, top5], verbose=False)
 
     #mind.pt_quantize(backend='x86', datasets={"test": val_loader}, metrics=[top1, top5])
         
