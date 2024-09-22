@@ -226,7 +226,7 @@ if __name__ == "__main__":
     
     from micromind.quantize import quantize_pt
 
-    quantize_pt(mind, ['classifier'], calib_loader, val_loader, [top1, top5], verbose=False)
+    quantize_pt(mind, {'classifier': (1, 3, 128, 128)}, calib_loader, val_loader, [top1, top5], verbose=False)
 
     #mind.pt_quantize(backend='x86', datasets={"test": val_loader}, metrics=[top1, top5])
         

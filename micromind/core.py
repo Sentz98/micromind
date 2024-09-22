@@ -438,8 +438,8 @@ class MicroMind(ABC):
             try:
                 from diffq import DiffQuantizer, UniformQuantizer
             except ImportError:
-                print("Did you install diffq?")
-                pass
+                raise ImportError("Did you install diffq?")
+            
             if self.hparams.quantizer == "DIFFQ":
                 self.quantizer = DiffQuantizer(
                     self.modules['classifier'], 

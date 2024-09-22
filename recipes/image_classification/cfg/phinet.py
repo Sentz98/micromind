@@ -19,7 +19,7 @@ return_layers = None
 
 # Logging
 log_level = "INFO"
-wandb_log = True
+wandb_log = False
 wandb_name = experiment_name
 wandb_id = 0000
 wandb_resume = True

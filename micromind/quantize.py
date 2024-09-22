@@ -70,7 +70,8 @@ def remove_depthwise(model):
         if isinstance(module, PhiNetConvBlock):
             for i, layer in enumerate(module._layers.children()):
                 if isinstance(layer, DepthwiseConv2d):
-                    module._layers[i] = convert_to_conv2d(layer)               
+                    module._layers[i] = convert_to_conv2d(layer) 
+                    module._layers[i].eval()              
 
 def get_input_shape(dataloader):
     for inputs, _ in dataloader:
@@ -80,8 +81,8 @@ def get_input_shape(dataloader):
 
 @torch.no_grad()
 def quantize_pt(
-    mind: Union[nn.Module, mm.MicroMind],
-    modules: list[str],
+    mind: mm.MicroMind,
+    modules: dict[str, list[int]],
     calibration_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     metrics: list,
@@ -92,27 +93,30 @@ def quantize_pt(
 
     Arguments
     ---------
-    mind : nn.Module
-        PyTorch module to be quantized.
-    save_path : Union[Path, str]
-        Output path for the quantized model.
-    calibration : torch.utils.data.DataLoader
+    mind : mm.MicroMind
+        MicroMind class
+    modules : dict[str, list[int]]
+        Dictionary of module to quantize and relative input shape
+    calibration_loader : torch.utils.data.DataLoader
         Calibration dataloader used for quantization.
     test_loader : torch.utils.data.DataLoader
         Test dataloader used for evaluation. 
+    save_path : Union[Path, str]
+        Output path for the quantized model. If None no save
+    verbose : bool
+        Print networks after preparation and calibration
+
     """
     modules_float = copy.deepcopy(mind.modules)
-    input_shape = get_input_shape(calibration_loader)
 
     mind.device = "cpu" # quant operations run only on cpu
     mind.modules = mind.modules.to(mind.device)
 
-    for module in modules:
-        # change depthwise
-        remove_depthwise(mind.modules[module])
-        mind.modules[module].eval()
+    for module in modules.keys():      
+        breakpoint()
         # fuse modules
         if isinstance(mind.modules[module], mm.networks.PhiNet):
+            remove_depthwise(mind.modules[module])
             phinet_fuse_modules(mind.modules[module])
         #TODO ?
         # elif isinstance(mind.modules[module], mm.networks.XiNet):
@@ -129,15 +133,15 @@ def quantize_pt(
             rtol=1e-03, 
             atol=1e-06, 
             num_tests=10, 
-            input_size=input_shape), f"Fused module {module} is not equivalent to the original module!"
+            input_size=modules[module]), f"Fused module {module} is not equivalent to the original module!"
 
         # add quant and dequant layers
         qutil.inject_quant(mind.modules[module])
 
         qconf = tq.get_default_qconfig("qnnpack")
-        mind.modules.qconfig = qconf
+        mind.modules[module].qconfig = qconf
 
-        tq.prepare(mind.modules, inplace=True)
+        tq.prepare(mind.modules[module], inplace=True)
 
     # Calibrate the quantizer
     logger.info("Calibrating the quantizer")
@@ -163,14 +167,20 @@ def quantize_pt(
         logger.info(f"Saved quantized model to {save_path}.")
 
     # Test the quantized model TODO SISTEMA LOG
-    mind.test(datasets={"test": test_loader}, metrics=metrics)
+    test_metrics = mind.test(datasets={"test": test_loader}, metrics=metrics)
 
     logger.info(f"FP32 size: {qutil.compute_model_size(modules_float)}; " 
                 +f"INT8 size: {qutil.compute_model_size(mind.modules)}")  
 
     for module in modules:
-        fp32_cpu_inference_latency  = qutil.measure_inference_latency(modules_float[module], device ="cpu", input_shape=input_shape)
-        int8_cpu_inference_latency  = qutil.measure_inference_latency(mind.modules[module], device ="cpu", input_shape=input_shape)
+        fp32_cpu_inference_latency  = qutil.measure_inference_latency(modules_float[module], device ="cpu", input_shape=modules[module])
+        int8_cpu_inference_latency  = qutil.measure_inference_latency(mind.modules[module], device ="cpu", input_shape=modules[module])
         print(module)
         print("FP32 CPU Inference Latency: {:.3f} ms".format(fp32_cpu_inference_latency[0]))
         print("INT8 CPU Inference Latency: {:.3f} ms".format(int8_cpu_inference_latency[0]))
+        test_metrics['latency_fp32'] = fp32_cpu_inference_latency[0]
+        test_metrics['latency_int8'] = int8_cpu_inference_latency[0]
+    
+
+    return test_metrics
+    
