@@ -2,16 +2,24 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/fpaissan/micromind/blob/main/LICENSE)
 [![PyPI version](https://img.shields.io/pypi/v/micromind)](https://pypi.org/project/micromind/)
 
-This is the official repo of `micromind`, a toolkit that aims at bridging two communities: artificial intelligence and embedded systems. `micromind` is based on [PyTorch](https://pytorch.org) and provides exportability for the supported models in ONNX, Intel OpenVINO, and TFLite.
+| 📘 [Tutorials](https://micromind-toolkit.github.io) | 🌐 [Website](https://micromind-toolkit.github.io/docs/) | 📚 [Documentation]() | 🤝 [Contributing]() | 🤗 [HuggingFace](https://huggingface.co/micromind) |
 
----------------------------------------------------------------------------------------------------------
+![GitHub Repo stars](https://img.shields.io/github/stars/micromind-toolkit/micromind?style=social) *Please, help our community project. Star on GitHub!*
 
-## 💡 Key features
+**MicroMind** is an **open-source** toolkit designed to seamlessly connect the artificial intelligence and embedded systems communities. Built on [PyTorch](https://pytorch.org), `micromind` focuses on delivering **efficient and scalable neural network architectures** that can be **easily trained and deployed across a broad spectrum of embedded platforms** — from ultra-low-power microcontrollers (MCUs) to high-performance microprocessors (MPUs).
 
-- Smooth flow from research to deployment;
-- Support for multimedia analytics recipes (image classification, sound event detection, etc);
-- Detailed API documentation;
-- Tutorials for embedded deployment;
+Our mission is to **simplify the path from AI research to real-world deployment**, making it practical to bring modern deep learning models to resource-constrained devices. Export support includes ONNX, Intel OpenVINO, and TensorFlow Lite.
+
+---
+
+## 💡 Key Features
+
+* ✅ Seamless transition from research to deployment
+* 🧠 Efficient models for embedded AI applications
+* 🔊 Recipes for multimedia tasks (image classification, sound event detection, etc.)
+* 📖 Detailed API documentation
+* 🎓 Hands-on tutorials for embedded deployment
+
 
 ---------------------------------------------------------------------------------------------------------
 

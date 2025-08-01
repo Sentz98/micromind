@@ -91,7 +91,24 @@ class TrainingCallback(ABC):
 
 
 class CallbackManager:
-    """Manages and executes callbacks during training"""
+    """
+    Class for manage and execute callbacks during training
+
+    Example
+    -------
+    .. doctest::
+
+        >>> trainer = MicroMind(hparams)
+        >>> ## Remove default LR scheduler if wanted a personalized one
+        >>> trainer.remove_callback_by_type(LearningRateSchedulerCallback)
+        >>> # Add custom callback
+        >>> trainer.add_callback(EarlyStoppingCallback(patience=15))
+        >>> trainer.add_callback(GradientClippingCallback(max_norm=1.0))
+        >>> trainer.add_callback(WarmupCallback(warmup_epochs=10))
+        >>> # Training
+        >>> trainer.train(epochs=100, datasets=datasets, metrics=metrics)
+    """
+
     
     def __init__(self, callbacks: List[TrainingCallback] = None):
         self.callbacks = callbacks or []
