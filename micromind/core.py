@@ -4,12 +4,12 @@ multi-gpu and FP16 training with HF Accelerate and much more.
 
 Authors:
     - Francesco Paissan, 2023
+    - Gabriele Santini, 2025
 """
 from abc import ABC, abstractmethod
 from argparse import Namespace
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from accelerate import DistributedDataParallelKwargs
 from torchinfo import summary
 
@@ -18,8 +18,15 @@ from accelerate import Accelerator
 from tqdm import tqdm
 import warnings
 
+from .enum import Stage
 from .utils.helpers import get_logger
 from .utils.checkpointer import Checkpointer
+
+from .callbacks import (
+    TrainingState, CallbackManager, ProgressCallback, ValidationProgressCallback, 
+    MetricsCallback, TrainingCallback, EarlyStoppingCallback, TrainingSetupCallback,
+    TrainingCleanupCallback, CheckpointingCallback, LearningRateSchedulerCallback
+)
 
 logger = get_logger()
 
@@ -31,16 +38,6 @@ default_cfg = {
     "lr": 0.001,  # this is ignored if you are overriding the configure_optimizers
     "debug": False,
 }
-
-
-@dataclass
-class Stage:
-    """enum to track training stage"""
-
-    train: int = 0
-    val: int = 1
-    test: int = 2
-
 
 class Metric:
     """
@@ -149,20 +146,54 @@ class MicroMind(ABC):
 
     """
 
-    def __init__(self, hparams=None):
+    def __init__(self, hparams=None, disable_progress=False):
         if hparams is None:
             hparams = Namespace(**default_cfg)
 
-        # here we should handle devices etc.
-        self.modules = torch.nn.ModuleDict({})  # init empty modules dict
+        # Core attributes
+        self.modules = torch.nn.ModuleDict({})
         self.hparams = hparams
         self.input_shape = None
+        self.current_epoch = 0
+        self.disable_progress = disable_progress
 
+        # Device management
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(ddp_kwargs)
         self.device = self.accelerator.device
 
-        self.current_epoch = 0
+        # Callback system
+        self.callback_manager = CallbackManager()
+        self._setup_default_callbacks()
+    
+    def _setup_default_callbacks(self):
+        """Setup default callbacks for backward compatibility"""
+        # Core training callbacks
+        self.callback_manager.add_callback(TrainingSetupCallback())
+        self.callback_manager.add_callback(TrainingCleanupCallback())
+        self.callback_manager.add_callback(CheckpointingCallback())
+        
+        # Progress and metrics callbacks
+        self.callback_manager.add_callback(ProgressCallback(disable_progress=self.disable_progress))
+        self.callback_manager.add_callback(ValidationProgressCallback(disable_progress=self.disable_progress))
+        self.callback_manager.add_callback(MetricsCallback())
+        
+        # Learning rate scheduler callback (defaults to batch-level stepping)
+        self.callback_manager.add_callback(LearningRateSchedulerCallback(step_on='batch'))
+
+    def add_callback(self, callback: TrainingCallback) -> None:
+        """Add a custom callback to the training loop"""
+        self.callback_manager.add_callback(callback)
+
+    def remove_callback(self, callback: TrainingCallback) -> None:
+        """Remove a callback from the training loop"""
+        self.callback_manager.remove_callback(callback)
+
+    def remove_callback_by_type(self, callback_type: type) -> None:
+        """Remove all callbacks of a specific type"""
+        callbacks_to_remove = [cb for cb in self.callback_manager.callbacks if isinstance(cb, callback_type)]
+        for callback in callbacks_to_remove:
+            self.callback_manager.remove_callback(callback)
 
     @abstractmethod
     def forward(self, batch):
@@ -233,7 +264,7 @@ class MicroMind(ABC):
             except Exception as e:  # maybe saved with DDP
                 tmp = f""" There was a problem loading the checkpoint...
                     Maybe trained with DDP... trying to load it anyways.
-                    Errow was {type(e).__name__}.
+                    Error was {type(e).__name__}.
                     """
                 warnings.warn(" ".join(tmp.split()))
 
@@ -379,39 +410,6 @@ class MicroMind(ABC):
 
         return macs
 
-    def on_train_start(self):
-        """Initializes the optimizer, modules and puts the networks on the right
-        devices. Optionally loads checkpoint if already present.
-
-        This function gets executed at the beginning of every training.
-        """
-
-        # pass debug status to checkpointer
-        self.checkpointer.debug = self.hparams.debug
-
-        init_opt = self.configure_optimizers()
-        if isinstance(init_opt, list) or isinstance(init_opt, tuple):
-            self.opt, self.lr_sched = init_opt
-        else:
-            self.opt = init_opt
-
-        self.init_devices()
-
-        self.start_epoch = 0
-        if self.checkpointer is not None:
-            # recover state
-            ckpt = self.checkpointer.recover_state()
-            if ckpt is not None:
-                accelerate_path, self.start_epoch = ckpt
-                self.accelerator.load_state(accelerate_path)
-        else:
-            tmp = """
-                You are not passing a checkpointer to the training function, \
-                thus no status will be saved. If this is not the intended behaviour \
-                please check https://micromind-toolkit.github.io/docs/").
-            """
-            warnings.warn(" ".join(tmp.split()))
-
     def init_devices(self):
         """Initializes the data pipeline and modules for DDP and accelerated inference.
         To control the device selection, use `accelerate config`."""
@@ -447,10 +445,6 @@ class MicroMind(ABC):
 
         self.modules.to(self.device)
 
-    def on_train_end(self):
-        """Runs at the end of each training. Cleans up before exiting."""
-        pass
-
     def eval(self):
         self.modules.eval()
 
@@ -461,221 +455,261 @@ class MicroMind(ABC):
         metrics: List[Metric] = [],
         checkpointer: Optional[Checkpointer] = None,
         debug: Optional[bool] = False,
+        callbacks: Optional[List[TrainingCallback]] = None,
     ) -> None:
         """
-        This method trains the model on the provided training dataset for the
-        specified number of epochs. It tracks training metrics and can
-        optionally perform validation during training, if the validation set is
-        provided.
-
+        Enhanced training method with callback support.
+        
         Arguments
         ---------
         epochs : int
             The number of training epochs.
         datasets : Dict
-            A dictionary of dataset loaders. Dataloader should be mapped to keys
-            "train", "val", and "test".
+            A dictionary of dataset loaders.
         metrics : Optional[List[Metric]]
-            A list of metrics to track during training. Default is an empty list.
-        checkpointer : Optional[mm.utils.Checkpointer]
-            Checkpointer used to log the experiments and save best checkpoints
-            during training.
+            A list of metrics to track during training.
+        checkpointer : Optional[Checkpointer]
+            Checkpointer for saving model state.
         debug : bool
-            Whether to run in debug mode. Default is False. If in debug mode,
-            only runs for few epochs
-            and with few batches.
+            Whether to run in debug mode.
+        callbacks : Optional[List[TrainingCallback]]
+            Additional callbacks to add for this training session.
         """
+        # Setup
         self.datasets = datasets
         self.metrics = metrics
         self.checkpointer = checkpointer
+        self.debug = debug
+        
+        # Add temporary callbacks for this training session
+        temp_callbacks = []
+        if callbacks:
+            for callback in callbacks:
+                self.add_callback(callback)
+                temp_callbacks.append(callback)
+
         assert "train" in self.datasets, "Training dataloader was not specified."
         assert epochs > 0, "You must specify at least one epoch."
 
-        self.debug = debug
+        # Initialize training state
+        total_batches = len(self.datasets["train"])
+        state = TrainingState(
+            epoch=0,
+            batch_idx=0,
+            total_epochs=epochs,
+            total_batches=total_batches
+        )
 
-        self.on_train_start()
+        # Call training start callbacks (this handles setup)
+        self.callback_manager.on_train_start(self, state)
 
-        if self.accelerator.is_local_main_process:
-            logger.info(
-                f"Starting from epoch {self.start_epoch + 1}."
-                + f" Training is scheduled for {epochs} epochs."
-            )
-
-        for e in range(self.start_epoch + 1, epochs + 1):
-            self.current_epoch = e
-            pbar = tqdm(
-                self.datasets["train"],
-                unit="batches",
-                ascii=True,
-                dynamic_ncols=True,
-                disable=not self.accelerator.is_local_main_process,
-            )
-            loss_epoch = 0
-            pbar.set_description(f"Running epoch {self.current_epoch}/{epochs}")
-            self.modules.train()
-            for idx, batch in enumerate(pbar):
-                if isinstance(batch, list):
-                    batch = [b.to(self.device) for b in batch]
-
-                self.opt.zero_grad()
-
-                with self.accelerator.autocast():
-                    model_out = self(batch)
-                    loss = self.compute_loss(model_out, batch)
-                    loss_epoch += loss.item()
-
-                self.accelerator.backward(loss)
-                self.opt.step()
-
-                if hasattr(self, "lr_sched"):
-                    # ok for cos_lr
-                    self.lr_sched.step()
-
-                for m in self.metrics:
-                    if (
-                        self.current_epoch + 1
-                    ) % m.eval_period == 0 and not m.eval_only:
-                        m(model_out, batch, Stage.train, self.device)
-
-                running_train = {}
-                for m in self.metrics:
-                    if (
-                        self.current_epoch + 1
-                    ) % m.eval_period == 0 and not m.eval_only:
-                        running_train["train_" + m.name] = m.reduce(Stage.train)
-
-                running_train.update({"train_loss": loss_epoch / (idx + 1)})
-
-                pbar.set_postfix(**running_train)
-
-                if self.debug and idx > 10:
+        try:
+            # Check for early stopping callback
+            early_stopping = None
+            for callback in self.callback_manager.callbacks:
+                if isinstance(callback, EarlyStoppingCallback):
+                    early_stopping = callback
                     break
 
-            pbar.close()
+            for e in range(self.start_epoch + 1, epochs + 1):
+                self.current_epoch = e
+                state.epoch = e
+                
+                # Epoch start callbacks
+                self.callback_manager.on_epoch_start(self, state)
+                
+                # Training epoch
+                epoch_metrics = self._train_epoch(state)
+                
+                # Validation if available
+                if "val" in datasets:
+                    val_metrics = self._validate_epoch(state)
+                    epoch_metrics.update(val_metrics)
+                
+                state.metrics = epoch_metrics
+                
+                # Epoch end callbacks (this handles checkpointing)
+                self.callback_manager.on_epoch_end(self, state)
+                
+                # Check early stopping
+                if early_stopping and early_stopping.should_stop_training():
+                    logger.info(f"Early stopping triggered at epoch {e}")
+                    break
+                
+                if e >= 1 and self.debug:
+                    break
 
-            train_metrics = {}
-            for m in self.metrics:
-                if (self.current_epoch + 1) % m.eval_period == 0 and not m.eval_only:
-                    train_metrics["train_" + m.name] = m.reduce(Stage.train, True)
+        finally:
+            # Training end callbacks (this handles cleanup)
+            self.callback_manager.on_train_end(self, state)
+            
+            # Remove temporary callbacks
+            for callback in temp_callbacks:
+                self.remove_callback(callback)
 
-            train_metrics.update({"train_loss": loss_epoch / (idx + 1)})
-
-            if "val" in datasets:
-                val_metrics = self.validate()
-                if (
-                    self.accelerator.is_local_main_process
-                    and self.checkpointer is not None
-                ):
-                    self.checkpointer(
-                        self,
-                        train_metrics,
-                        val_metrics,
-                    )
-            else:
-                val_metrics = train_metrics.update({"val_loss": loss_epoch / (idx + 1)})
-
-            if e >= 1 and self.debug:
-                break
-
-        self.on_train_end()
-        return None
-
-    @torch.no_grad()
-    def validate(self) -> Dict:
-        """Runs the validation step."""
-        assert "val" in self.datasets, "Validation dataloader was not specified."
-        self.modules.eval()
-
-        pbar = tqdm(
-            self.datasets["val"],
-            unit="batches",
-            ascii=True,
-            dynamic_ncols=True,
-            disable=not self.accelerator.is_local_main_process,
-        )
+    def _train_epoch(self, state: TrainingState) -> Dict[str, float]:
+        """Execute one training epoch with callbacks"""
+        self.modules.train()
         loss_epoch = 0
-        pbar.set_description("Validation...")
-        with self.accelerator.autocast():
-            for idx, batch in enumerate(pbar):
-                if isinstance(batch, list):
-                    batch = [b.to(self.device) for b in batch]
-
-                self.opt.zero_grad()
-
+        
+        for idx, batch in enumerate(self.datasets["train"]):
+            state.batch_idx = idx
+            state.batch = batch
+            state.stage = Stage.train
+            
+            # Batch start callbacks
+            self.callback_manager.on_batch_start(self, state)
+            
+            # Prepare batch
+            if isinstance(batch, list):
+                batch = [b.to(self.device) for b in batch]
+            
+            self.opt.zero_grad()
+            
+            # Forward pass
+            with self.accelerator.autocast():
                 model_out = self(batch)
                 loss = self.compute_loss(model_out, batch)
-                for m in self.metrics:
-                    if (self.current_epoch + 1) % m.eval_period == 0:
-                        m(model_out, batch, Stage.val, self.device)
-
                 loss_epoch += loss.item()
-                pbar.set_postfix(loss=loss_epoch / (idx + 1))
+            
+            state.outputs = model_out
+            state.loss = loss
+            
+            # Loss computed callback
+            self.callback_manager.on_loss_computed(self, state)
+            
+            # Backward pass
+            self.accelerator.backward(loss)
+            self.opt.step()
+            
+            # Backward end callback
+            self.callback_manager.on_backward_end(self, state)
+            
+            # Batch end callbacks (includes metrics computation and progress updates)
+            self.callback_manager.on_batch_end(self, state)
+            
+            if self.debug and idx > 10:
+                break
+        
+        # Compute final training metrics
+        train_metrics = {}
+        for m in self.metrics:
+            if (state.epoch) % m.eval_period == 0 and not m.eval_only:
+                train_metrics["train_" + m.name] = m.reduce(Stage.train, True)
+        
+        train_metrics.update({"train_loss": loss_epoch / (state.batch_idx + 1)})
+        
+        return train_metrics
 
+    @torch.no_grad()
+    def _validate_epoch(self, state: TrainingState) -> Dict[str, float]:
+        """Execute validation epoch with callbacks"""
+        assert "val" in self.datasets, "Validation dataloader was not specified."
+        
+        self.modules.eval()
+        loss_epoch = 0
+        
+        # Validation start callback
+        self.callback_manager.on_validation_start(self, state)
+        
+        with self.accelerator.autocast():
+            for idx, batch in enumerate(self.datasets["val"]):
+                state.batch_idx = idx
+                state.batch = batch
+                state.stage = Stage.val
+                
+                if isinstance(batch, list):
+                    batch = [b.to(self.device) for b in batch]
+                
+                model_out = self(batch)
+                loss = self.compute_loss(model_out, batch)
+                
+                state.outputs = model_out
+                state.loss = loss
+                
+                # Batch end callback for validation (includes metrics and progress)
+                self.callback_manager.on_batch_end(self, state)
+                
+                loss_epoch += loss.item()
+                
                 if self.debug and idx > 10:
                     break
-
+        
+        # Compute validation metrics
         val_metrics = {}
         for m in self.metrics:
-            if (self.current_epoch + 1) % m.eval_period == 0:
+            if (state.epoch) % m.eval_period == 0:
                 val_metrics["val_" + m.name] = m.reduce(Stage.val, True)
-
-        val_metrics.update({"val_loss": loss_epoch / (idx + 1)})
-
-        pbar.close()
-
+        
+        val_metrics.update({"val_loss": loss_epoch / (state.batch_idx + 1)})
+        
+        # Validation end callback
+        self.callback_manager.on_validation_end(self, state)
+        
         return val_metrics
 
     @torch.no_grad()
-    def test(self, datasets: Dict = {}, metrics: List[Metric] = []) -> None:
-        """Runs the test steps.
+    def validate(self) -> Dict:
+        """Legacy validation method for backward compatibility"""
+        state = TrainingState(
+            epoch=self.current_epoch,
+            batch_idx=0,
+            total_epochs=1,
+            total_batches=len(self.datasets["val"]) if "val" in self.datasets else 0
+        )
+        return self._validate_epoch(state)
 
-        Arguments
-        ---------
-        datasets : Dict
-            Dictionary with the test DataLoader. Should be present in the key
-            `test`.
-        metrics : List[Metric]
-            List of metrics to compute during test step.
-
-        Returns
-        -------
-        Metrics computed on test set. : Dict[torch.Tensor]
-        """
+    @torch.no_grad()
+    def test(self, datasets: Dict = {}, metrics: List[Metric] = []) -> Dict:
+        """Test method with callback support"""
         assert "test" in datasets, "Test dataloader was not specified."
         self.modules.eval()
 
-        pbar = tqdm(
-            datasets["test"],
-            unit="batches",
-            ascii=True,
-            dynamic_ncols=True,
-            disable=not self.accelerator.is_local_main_process,
+        total_batches = len(datasets["test"])
+        state = TrainingState(
+            epoch=0,
+            batch_idx=0,
+            total_epochs=1,
+            total_batches=total_batches,
+            stage=Stage.test
         )
+
         loss_epoch = 0
-        pbar.set_description("Testing...")
+        
+        # Create a simple progress bar callback for testing
+        if self.accelerator.is_local_main_process:
+            pbar = tqdm(datasets["test"], unit="batches", ascii=True, 
+                       dynamic_ncols=True, desc="Testing...")
+        
         with self.accelerator.autocast():
-            for idx, batch in enumerate(pbar):
+            for idx, batch in enumerate(datasets["test"]):
+                state.batch_idx = idx
+                state.batch = batch
+                
                 if isinstance(batch, list):
                     batch = [b.to(self.device) for b in batch]
 
                 model_out = self(batch)
                 loss = self.compute_loss(model_out, batch)
+                
                 for m in metrics:
                     m(model_out, batch, Stage.test, self.device)
 
                 loss_epoch += loss.item()
-                pbar.set_postfix(loss=loss_epoch / (idx + 1))
+                
+                if self.accelerator.is_local_main_process:
+                    pbar.set_postfix(loss=loss_epoch / (idx + 1))
 
-        pbar.close()
+        if self.accelerator.is_local_main_process:
+            pbar.close()
 
         test_metrics = {"test_" + m.name: m.reduce(Stage.test, True) for m in metrics}
         test_metrics.update({"test_loss": loss_epoch / (idx + 1)})
-        s_out = (
-            "Testing "
-            + " - ".join([f"{k}: {v:.2f}" for k, v in test_metrics.items()])
-            + "; "
-        )
-
+        
+        s_out = ("Testing " + 
+                " - ".join([f"{k}: {v:.2f}" for k, v in test_metrics.items()]) + 
+                "; ")
         logger.info(s_out)
 
         return test_metrics
+    
