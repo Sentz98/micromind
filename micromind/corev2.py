@@ -161,11 +161,18 @@ class MicroMind(ABC):
         self.hparams = hparams
         self.input_shape = None
         self.current_epoch = 0
+        self.start_epoch = 0  # Fix: Initialize start_epoch
         self.disable_progress = disable_progress
+
+        # Fix: Initialize these attributes that are used in init_devices
+        self.datasets = {}
+        self.metrics = []
+        self.checkpointer = None
+        self.debug = False
 
         # Device management
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        self.accelerator = Accelerator(ddp_kwargs)
+        self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])  # Fix: Pass as list
         self.device = self.accelerator.device
 
         # Callback system
@@ -190,17 +197,20 @@ class MicroMind(ABC):
     def add_callback(self, callback: TrainingCallback) -> None:
         """Add a custom callback to the training loop"""
         self.callback_manager.add_callback(callback)
+        logger.info(f"Added callback: {callback.__class__.__name__}")
 
     def remove_callback(self, callback: TrainingCallback) -> None:
         """Remove a callback from the training loop"""
         self.callback_manager.remove_callback(callback)
+        logger.info(f"Removed callback: {callback.__class__.__name__}")
 
     def remove_callback_by_type(self, callback_type: type) -> None:
         """Remove all callbacks of a specific type"""
         callbacks_to_remove = [cb for cb in self.callback_manager.callbacks if isinstance(cb, callback_type)]
         for callback in callbacks_to_remove:
             self.callback_manager.remove_callback(callback)
-            
+            logger.info(f"Removed callback by type: {callback.__class__.__name__}")
+
     def log_active_callbacks(self) -> None:
         """Log all currently active callbacks"""
         logger.info("=== Active Callbacks ===")
@@ -296,7 +306,7 @@ class MicroMind(ABC):
         self,
         save_dir: Union[Path, str],
         out_format: Optional[str] = "onnx",
-        input_shape: Optional[str] = None,
+        input_shape: Optional[Tuple] = None,  # Fix: Changed type hint
         qbatch: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -327,7 +337,10 @@ class MicroMind(ABC):
             save_dir = Path(save_dir)
         save_dir = save_dir.joinpath(self.hparams.experiment_name)
 
-        self.set_input_shape(input_shape)
+        # Fix: Use input_shape parameter if provided
+        if input_shape is not None:
+            self.set_input_shape(input_shape)
+            
         assert (
             self.input_shape is not None
         ), "You should pass the input_shape of the model."
@@ -427,6 +440,10 @@ class MicroMind(ABC):
         """Initializes the data pipeline and modules for DDP and accelerated inference.
         To control the device selection, use `accelerate config`."""
 
+        # Initialize optimizer if not already done
+        if not hasattr(self, "opt"):
+            self.opt = self.configure_optimizers()
+
         # pass each module through DDP independently
         convert = list(self.modules.values())
         if hasattr(self, "opt"):
@@ -435,7 +452,7 @@ class MicroMind(ABC):
         if hasattr(self, "lr_sched"):
             convert += [self.lr_sched]
 
-        if hasattr(self, "datasets"):
+        if hasattr(self, "datasets") and self.datasets:
             # if the datasets are store here, prepare them for DDP
             convert += list(self.datasets.values())
 
@@ -452,7 +469,7 @@ class MicroMind(ABC):
             self.lr_sched = accelerated[1 + len(self.modules)]
             self.accelerator.register_for_checkpointing(self.lr_sched)
 
-        if hasattr(self, "datasets"):
+        if hasattr(self, "datasets") and self.datasets:
             for i, key in enumerate(list(self.datasets.keys())[::-1]):
                 self.datasets[key] = accelerated[-(i + 1)]
 
@@ -471,7 +488,7 @@ class MicroMind(ABC):
         callbacks: Optional[List[TrainingCallback]] = None,
     ) -> None:
         """
-        Enhanced training method with callback support.
+        Enhanced training method with callback support and detailed logging.
         
         Arguments
         ---------
@@ -488,6 +505,9 @@ class MicroMind(ABC):
         callbacks : Optional[List[TrainingCallback]]
             Additional callbacks to add for this training session.
         """
+        logger.info("=== STARTING TRAINING ===")
+        logger.info(f"Epochs: {epochs}, Debug: {debug}")
+        
         # Setup
         self.datasets = datasets
         self.metrics = metrics
@@ -497,6 +517,7 @@ class MicroMind(ABC):
         # Add temporary callbacks for this training session
         temp_callbacks = []
         if callbacks:
+            logger.info("Adding temporary callbacks for this training session:")
             for callback in callbacks:
                 self.add_callback(callback)
                 temp_callbacks.append(callback)
@@ -517,6 +538,7 @@ class MicroMind(ABC):
         )
 
         # Call training start callbacks (this handles setup)
+        logger.info("🚀 Executing on_train_start callbacks...")
         self.callback_manager.on_train_start(self, state)
 
         try:
@@ -525,43 +547,62 @@ class MicroMind(ABC):
             for callback in self.callback_manager.callbacks:
                 if isinstance(callback, EarlyStoppingCallback):
                     early_stopping = callback
+                    logger.info(f"Early stopping callback found: {callback.__class__.__name__}")
                     break
 
             for e in range(self.start_epoch + 1, epochs + 1):
+                logger.info(f"📊 Starting epoch {e}/{epochs}")
                 self.current_epoch = e
                 state.epoch = e
                 
                 # Epoch start callbacks
+                logger.info(f"⚡ Executing on_epoch_start callbacks for epoch {e}...")
                 self.callback_manager.on_epoch_start(self, state)
                 
                 # Training epoch
+                logger.info(f"🎓 Training epoch {e}...")
                 epoch_metrics = self._train_epoch(state)
                 
                 # Validation if available
                 if "val" in datasets:
+                    logger.info(f"🔍 Validating epoch {e}...")
                     val_metrics = self._validate_epoch(state)
                     epoch_metrics.update(val_metrics)
                 
                 state.metrics = epoch_metrics
                 
+                # Log epoch metrics
+                metrics_str = " - ".join([f"{k}: {v:.4f}" for k, v in epoch_metrics.items()])
+                logger.info(f"📈 Epoch {e} metrics: {metrics_str}")
+                
                 # Epoch end callbacks (this handles checkpointing)
+                logger.info(f"✅ Executing on_epoch_end callbacks for epoch {e}...")
                 self.callback_manager.on_epoch_end(self, state)
                 
                 # Check early stopping
                 if early_stopping and early_stopping.should_stop_training():
-                    logger.info(f"Early stopping triggered at epoch {e}")
+                    logger.info(f"⏹️ Early stopping triggered at epoch {e}")
                     break
                 
                 if e >= 1 and self.debug:
+                    logger.info("🐛 Debug mode: stopping after first epoch")
                     break
 
+        except Exception as e:
+            logger.error(f"❌ Training failed with error: {str(e)}")
+            raise
         finally:
             # Training end callbacks (this handles cleanup)
+            logger.info("🏁 Executing on_train_end callbacks...")
             self.callback_manager.on_train_end(self, state)
             
             # Remove temporary callbacks
-            for callback in temp_callbacks:
-                self.remove_callback(callback)
+            if temp_callbacks:
+                logger.info("🧹 Removing temporary callbacks...")
+                for callback in temp_callbacks:
+                    self.remove_callback(callback)
+                    
+            logger.info("=== TRAINING COMPLETED ===")
 
     def _train_epoch(self, state: TrainingState) -> Dict[str, float]:
         """Execute one training epoch with callbacks"""
@@ -574,6 +615,8 @@ class MicroMind(ABC):
             state.stage = Stage.train
             
             # Batch start callbacks
+            if idx == 0:  # Log only for first batch to avoid spam
+                logger.debug("⏰ Executing on_batch_start callbacks...")
             self.callback_manager.on_batch_start(self, state)
             
             # Prepare batch
@@ -592,6 +635,8 @@ class MicroMind(ABC):
             state.loss = loss
             
             # Loss computed callback
+            if idx == 0:
+                logger.debug("💰 Executing on_loss_computed callbacks...")
             self.callback_manager.on_loss_computed(self, state)
             
             # Backward pass
@@ -599,12 +644,17 @@ class MicroMind(ABC):
             self.opt.step()
             
             # Backward end callback
+            if idx == 0:
+                logger.debug("⬅️ Executing on_backward_end callbacks...")
             self.callback_manager.on_backward_end(self, state)
             
             # Batch end callbacks (includes metrics computation and progress updates)
+            if idx == 0:
+                logger.debug("🔚 Executing on_batch_end callbacks...")
             self.callback_manager.on_batch_end(self, state)
             
             if self.debug and idx > 10:
+                logger.info("🐛 Debug mode: stopping after 10 batches")
                 break
         
         # Compute final training metrics
@@ -626,6 +676,7 @@ class MicroMind(ABC):
         loss_epoch = 0
         
         # Validation start callback
+        logger.debug("🔍 Executing on_validation_start callbacks...")
         self.callback_manager.on_validation_start(self, state)
         
         with self.accelerator.autocast():
@@ -644,11 +695,14 @@ class MicroMind(ABC):
                 state.loss = loss
                 
                 # Batch end callback for validation (includes metrics and progress)
+                if idx == 0:
+                    logger.debug("🔚 Executing validation on_batch_end callbacks...")
                 self.callback_manager.on_batch_end(self, state)
                 
                 loss_epoch += loss.item()
                 
                 if self.debug and idx > 10:
+                    logger.info("🐛 Debug mode: stopping validation after 10 batches")
                     break
         
         # Compute validation metrics
@@ -660,6 +714,7 @@ class MicroMind(ABC):
         val_metrics.update({"val_loss": loss_epoch / (state.batch_idx + 1)})
         
         # Validation end callback
+        logger.debug("✅ Executing on_validation_end callbacks...")
         self.callback_manager.on_validation_end(self, state)
         
         return val_metrics
@@ -667,11 +722,15 @@ class MicroMind(ABC):
     @torch.no_grad()
     def validate(self) -> Dict:
         """Legacy validation method for backward compatibility"""
+        if "val" not in self.datasets:
+            logger.warning("No validation dataset available")
+            return {}
+            
         state = TrainingState(
             epoch=self.current_epoch,
             batch_idx=0,
             total_epochs=1,
-            total_batches=len(self.datasets["val"]) if "val" in self.datasets else 0
+            total_batches=len(self.datasets["val"])
         )
         return self._validate_epoch(state)
 
@@ -679,6 +738,8 @@ class MicroMind(ABC):
     def test(self, datasets: Dict = {}, metrics: List[Metric] = []) -> Dict:
         """Test method with callback support"""
         assert "test" in datasets, "Test dataloader was not specified."
+        logger.info("🧪 Starting testing...")
+        
         self.modules.eval()
 
         total_batches = len(datasets["test"])
@@ -728,4 +789,3 @@ class MicroMind(ABC):
         logger.info(s_out)
 
         return test_metrics
-    

@@ -174,6 +174,26 @@ def top_k_accuracy(k=1):
 
     return acc
 
+class APILoggingCallback(mm.TrainingCallback):
+
+    def __init__(self, log_frequency: int = 1):
+        self.log_every = log_frequency
+    
+    def on_epoch_end(self, trainer, state: mm.TrainingState) -> None:
+        if trainer.accelerator.is_local_main_process and state.metrics and state.epoch%self.log_every==0:
+            metrics_str = " - ".join([f"{k}: {v:.4f}" for k, v in state.metrics.items()])
+        
+            print(f"Epoch {state.epoch}/{state.total_epochs} - {metrics_str}")
+    
+    def on_batch_end(self, trainer, state: mm.TrainingState) -> None:
+        if (trainer.accelerator.is_local_main_process and 
+            state.batch_idx % self.log_every == 0 and 
+            state.stage == mm.Stage.train):
+            
+            lr = trainer.opt.param_groups[0]['lr'] if hasattr(trainer, 'opt') else 0.0
+            # TODO f"Epoch {state.epoch} - Batch {state.batch_idx}/{state.total_batches} - "
+            #           f"Loss: {state.loss.item():.4f} - LR: {lr:.6f}"
+
 
 if __name__ == "__main__":
     assert len(sys.argv) > 1, "Please pass the configuration file to the script."
@@ -194,12 +214,28 @@ if __name__ == "__main__":
     top1 = mm.Metric("top1_acc", top_k_accuracy(k=1), eval_only=True)
     top5 = mm.Metric("top5_acc", top_k_accuracy(k=5), eval_only=True)
 
+    # Add custom API logging callback
+    api_callback = APILoggingCallback(
+        log_frequency=1,  # Log every epoch
+    )
+    
+    callbacks = [
+        api_callback,
+        # Add early stopping if validation accuracy doesn't improve
+        mm.callbacks.EarlyStoppingCallback(
+            patience=10, 
+            monitor='val_top1_acc', 
+            min_delta=0.001
+        ),
+    ]
+
     mind.train(
         epochs=hparams.epochs,
         datasets={"train": train_loader, "val": val_loader},
         metrics=[top5, top1],
         checkpointer=checkpointer,
         debug=hparams.debug,
+        callbacks=callbacks
     )
 
     mind.test(datasets={"test": val_loader}, metrics=[top1, top5])

@@ -116,11 +116,13 @@ class CallbackManager:
     def add_callback(self, callback: TrainingCallback) -> None:
         """Add a callback to the manager"""
         self.callbacks.append(callback)
+        logger.info(f"Added callback: {callback.__class__.__name__}")
     
     def remove_callback(self, callback: TrainingCallback) -> None:
         """Remove a callback from the manager"""
         if callback in self.callbacks:
             self.callbacks.remove(callback)
+            logger.info(f"Removed callback: {callback.__class__.__name__}")
     
     def _call_callbacks(self, method_name: str, trainer, state: TrainingState) -> None:
         """Execute a specific callback method on all callbacks"""
