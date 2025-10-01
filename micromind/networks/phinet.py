@@ -6,8 +6,9 @@ Authors:
     - Alberto Ancilotto, 2023
     - Matteo Beltrami, 2023
     - Matteo Tremonti, 2023
+    - Gabriele Santini, 2025
 """
-from typing import List
+from dataclasses import dataclass
 
 import torch
 import torch.ao.nn.quantized as nnq
@@ -15,86 +16,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchinfo import summary
 
+from ._utils import _make_divisible, correct_pad
+from ..utils.helpers import get_logger
 
-def _make_divisible(v, divisor=8, min_value=None):
-    """
-    This function is taken from the original tf repo. It can be seen here:
-    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+logger = get_logger()
 
-    It ensures that all layers have a channel number that is divisible by divisor.
-
-    Arguments
-    ---------
-    v : int
-        The original number of channels.
-    divisor : int, optional
-        The divisor to ensure divisibility (default is 8).
-    min_value : int or None, optional
-        The minimum value for the divisible channels (default is None).
-
-    Returns
-    -------
-    int
-        The adjusted number of channels.
-    """
-    if min_value is None:
-        min_value = divisor
-    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
-    # Make sure that round down does not go down by more than 10%.
-    if new_v < 0.9 * v:
-        new_v += divisor
-    return new_v
-
-
-def correct_pad(input_shape, kernel_size):
-    """Returns a tuple for zero-padding for 2D convolution with downsampling.
-
-    Arguments
-    ---------
-    input_shape : tuple or list
-        Shape of the input tensor (height, width).
-    kernel_size : int or tuple
-        Size of the convolution kernel.
-
-    Returns
-    -------
-    tuple
-        A tuple representing the zero-padding in the format (left, right, top, bottom).
-    """
-    if isinstance(kernel_size, int):
-        kernel_size = (kernel_size, kernel_size)
-
-    if input_shape[0] is None:
-        adjust = (1, 1)
-    else:
-        adjust = (1 - input_shape[0] % 2, 1 - input_shape[1] % 2)
-
-    correct = (kernel_size[0] // 2, kernel_size[1] // 2)
-
-    return (
-        int(correct[1] - adjust[1]),
-        int(correct[1]),
-        int(correct[0] - adjust[0]),
-        int(correct[0]),
-    )
-
-
-def preprocess_input(x, **kwargs):
-    """Normalize input channels between [-1, 1].
-
-    Arguments
-    ---------
-    x : torch.Tensor
-        Input tensor to be preprocessed.
-
-    Returns
-    -------
-    torch.Tensor
-        Normalized tensor with values between [-1, 1].
-    """
-
-    return (x / 128.0) - 1
-
+__all__ = [
+    "PhiNet",
+    "PhiNetArchConfig", 
+    "PhiNetConfig",
+    "SEBlock",
+    "PhiNetConvBlock",
+]
 
 def get_xpansion_factor(t_zero, beta, block_id, num_blocks):
     """Compute the expansion factor based on the formula from the paper.
@@ -135,18 +68,6 @@ class ReLUMax(torch.nn.Module):
         self.max = max
 
     def forward(self, x):
-        """Forward pass of ReLUMax.
-
-        Arguments
-        ---------
-        x : torch.Tensor
-            Input tensor.
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor after applying ReLU with max value.
-        """
         return torch.clamp(x, min=0, max=self.max)
 
 
@@ -189,19 +110,6 @@ class SEBlock(torch.nn.Module):
         self.mult = nnq.FloatFunctional()
 
     def forward(self, x):
-        """Executes the squeeze-and-excitation block.
-
-        Arguments
-        ---------
-        x : torch.Tensor
-            Input tensor.
-
-        Returns
-        -------
-        torch.Tensor
-            Output of the squeeze-and-excitation block.
-        """
-
         inp = x
         x = F.adaptive_avg_pool2d(x, (1, 1))
         x = self.se_conv(x)
@@ -293,18 +201,18 @@ class SeparableConv2d(torch.nn.Module):
         self,
         in_channels,
         out_channels,
-        activation=torch.nn.functional.relu,
+        activation: nn.Module | None = None,
         kernel_size=3,
         stride=1,
         padding=0,
         dilation=1,
         bias=True,
         padding_mode="zeros",
-        depth_multiplier=1,
+        depth_multiplier=1, #TODO remove unused params?
     ):
         super().__init__()
 
-        self._layers = torch.nn.ModuleList()
+        layers: list[nn.Module] = []
 
         depthwise = torch.nn.Conv2d(
             in_channels=in_channels,
@@ -330,34 +238,26 @@ class SeparableConv2d(torch.nn.Module):
             padding_mode=padding_mode,
         )
 
-        bn = torch.nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.999)
+        bn = torch.nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.999) # TODO TensorFlow-style momentum for compatibility (keep?)
 
-        self._layers.append(depthwise)
-        self._layers.append(spatialConv)
-        self._layers.append(bn)
-        self._layers.append(activation)
+        layers.append(depthwise)
+        layers.append(spatialConv)
+        layers.append(bn)
+        if activation is None:
+            activation = nn.ReLU(inplace=True)
+        layers.append(activation)
+
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x):
-        """Executes the SeparableConv2d block.
-
-        Arguments
-        ---------
-        x : torch.Tensor
-            Input tensor.
-
-        Returns
-        -------
-        torch.Tensor
-            Output of the convolution.
-        """
-        for layer in self._layers:
-            x = layer(x)
-
-        return x
+        return self.block(x)
 
 
 class PhiNetConvBlock(nn.Module):
-    """Implements PhiNet's convolutional block.
+    """
+    Implements PhiNet's convolutional block.
+
+    Structure: Expand -> Depthwise -> SE (optional) -> Project -> Residual
 
     Arguments
     ---------
@@ -402,7 +302,7 @@ class PhiNetConvBlock(nn.Module):
 
         self.skip_conn = False
 
-        self._layers = torch.nn.ModuleList()
+        layers: list[nn.Module] = []
         in_channels = in_shape[0]
 
         # Define activation function
@@ -424,17 +324,17 @@ class PhiNetConvBlock(nn.Module):
             bn1 = nn.BatchNorm2d(
                 _make_divisible(int(expansion * in_channels), divisor=divisor),
                 eps=1e-3,
-                momentum=0.999,
+                momentum=0.999, # TODO TensorFlow-style momentum for compatibility (keep?)
             )
 
-            self._layers.append(conv1)
-            self._layers.append(bn1)
-            self._layers.append(activation)
+            layers.append(conv1)
+            layers.append(bn1)
+            layers.append(activation)
 
         if stride == 2:
-            padding = correct_pad([res, res], 3)
+            padding = correct_pad([res, res], 3) # TODO è sbagliato, res ora è un bool
 
-        self._layers.append(nn.Dropout2d(dp_rate))
+        layers.append(nn.Dropout2d(dp_rate))
 
         d_mul = 1
         in_channels_dw = (
@@ -455,7 +355,7 @@ class PhiNetConvBlock(nn.Module):
         bn_dw1 = nn.BatchNorm2d(
             out_channels_dw,
             eps=1e-3,
-            momentum=0.999,
+            momentum=0.999, # TODO TensorFlow-style momentum for compatibility (keep?)
         )
 
         # It is necessary to reinitialize the activation
@@ -466,16 +366,16 @@ class PhiNetConvBlock(nn.Module):
         else:
             activation = ReLUMax(6)
 
-        self._layers.append(dw1)
-        self._layers.append(bn_dw1)
-        self._layers.append(activation)
+        layers.append(dw1)
+        layers.append(bn_dw1)
+        layers.append(activation)
 
         if has_se:
             num_reduced_filters = _make_divisible(
                 max(1, int(out_channels_dw / 6)), divisor=divisor
             )
             se_block = SEBlock(out_channels_dw, num_reduced_filters, h_swish=h_swish)
-            self._layers.append(se_block)
+            layers.append(se_block)
 
         conv2 = nn.Conv2d(
             in_channels=out_channels_dw,
@@ -488,11 +388,12 @@ class PhiNetConvBlock(nn.Module):
         bn2 = nn.BatchNorm2d(
             filters,
             eps=1e-3,
-            momentum=0.999,
+            momentum=0.999, # TODO TensorFlow-style momentum for compatibility (keep?)
         )
 
-        self._layers.append(conv2)
-        self._layers.append(bn2)
+        layers.append(conv2)
+        layers.append(bn2)
+        self.block = nn.Sequential(*layers)
 
         if res and in_channels == filters and stride == 1:
             self.skip_conn = True
@@ -501,346 +402,331 @@ class PhiNetConvBlock(nn.Module):
             self.op = nnq.FloatFunctional()
 
     def forward(self, x):
-        """Executes the PhiNet convolutional block.
-
-        Arguments
-        ---------
-        x : torch.Tensor
-            Input to the convolutional block.
-
-        Returns
-        -------
-        torch.Tensor
-            Output of the convolutional block.
-        """
-
+        result = self.block(x)
         if self.skip_conn:
-            inp = x
+            return self.op.add(x, result)
+        return result
+    
+@dataclass
+class PhiNetArchConfig:
+    """Architecture-defining parameters (these vary between model variants)."""
+    num_layers: int = 7
+    alpha: float = 0.2          # Width multiplier
+    beta: float = 1.0           # Expansion shape factor
+    t_zero: float = 6.0         # Base expansion
+    downsampling_layers: list[int] | None = None
+    conv5_percent: float = 0.0  # When to use 5x5 kernels
+    # Stem configuration
+    first_conv_stride: int = 2            # Stem stride
+    use_separable_stem: bool = True       # SeparableConv vs regular Conv
+    
+    def __post_init__(self):
+        if self.downsampling_layers is None:
+            self.downsampling_layers = [5, 7]
+        
+        if self.num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {self.num_layers}")
+        if any(layer > self.num_layers for layer in self.downsampling_layers):
+            raise ValueError("downsampling_layers contains indices beyond num_layers")
+        
+        if not 0 < self.alpha <= 2:
+            raise ValueError(f"alpha should be in (0, 2], got {self.alpha}")
+        if not 2 <= self.t_zero <= 8:
+            logger.warning("Is recommended to keep t_zero between 2 and 8, " \
+            "using by default 6 for networks larger than 5MMACC and 5 for networks smaller than that")
 
-        for layer in self._layers:
-            x = layer(x)
-
-        if self.skip_conn:
-            return self.op.add(x, inp)  # Equivalent to ``torch.add(a, b)``
-
-        return x
+        
 
 
-class PhiNet(nn.Module):
-    """
-    This class implements the PhiNet architecture.
+@dataclass  
+class PhiNetConfig:
+    """Implementation and platform-specific settings."""   
+    h_swish = False                         # Use hard-swish vs ReLU6
+    squeeze_excite: bool = True             # Use SE blocks            
+    residuals: bool = True                # Use residual connections
+    divisor: int = 8                      # Channel divisibility
+    pool: bool = False
+    # Compatibility mode (for embedded platforms)
+    compatibility: bool = False           # Disable hard operations
 
-    Arguments
-    ---------
-    input_shape : tuple
-        Input resolution as (C, H, W).
-    num_layers : int
-        Number of convolutional blocks.
-    alpha: float
-        Width multiplier for PhiNet architecture.
-    beta : float
-        Shape factor of PhiNet.
-    t_zero : float
-        Base expansion factor for PhiNet.
-    include_top : bool
-        Whether to include classification head or not.
-    num_classes : int
-        Number of classes for the classification head.
-    compatibility : bool
-        `True` to maximise compatibility among embedded platforms (changes network).
+    init_weights: bool = False
+    
+    def __post_init__(self):
+        if self.compatibility:
+            self.h_swish = False          # Use hard-swish vs ReLU6
+            self.squeeze_excite: bool = True   # Use SE blocks
 
-    """
-
-    def get_complexity(self):
-        """Returns MAC and number of parameters of initialized architecture.
-
-        Returns
-        -------
-            Dictionary with complexity characterization of the network. : dict
-
-        Example
-        -------
-        .. doctest::
-
-            >>> from micromind.networks import PhiNet
-            >>> model = PhiNet((3, 224, 224))
-            >>> model.get_complexity()
-            {'MAC': 9817670, 'params': 30917}
-        """
-        temp = summary(
-            self, input_data=torch.zeros([1] + list(self.input_shape)), verbose=0
-        )
-
-        return {"MAC": temp.total_mult_adds, "params": temp.total_params}
-
-    def get_MAC(self):
-        """Returns number of MACs for this architecture.
-
-        Returns
-        -------
-            Number of MAC for this network. : int
-
-        Example
-        -------
-        .. doctest::
-
-            >>> from micromind.networks import PhiNet
-            >>> model = PhiNet((3, 224, 224))
-            >>> model.get_MAC()
-            9817670
-        """
-        return self.get_complexity()["MAC"]
-
-    def get_params(self):
-        """Returns number of params for this architecture.
-
-        Returns
-        -------
-            Number of parameters for this network. : int
-
-        Example
-        -------
-        .. doctest::
-
-            >>> from micromind.networks import PhiNet
-            >>> model = PhiNet((3, 224, 224))
-            >>> model.get_params()
-            30917
-        """
-        return self.get_complexity()["params"]
-
+class PhiNet(nn.Module):   
     def __init__(
         self,
-        input_shape: List[int],
-        num_layers: int = 7,  # num_layers
-        alpha: float = 0.2,
-        beta: float = 1.0,
-        t_zero: float = 6,
-        include_top: bool = False,
-        num_classes: int = 10,
-        compatibility: bool = False,
-        downsampling_layers: List[int] = [5, 7],  # S2
-        conv5_percent: float = 0.0,  # S2
-        first_conv_stride: int = 2,  # S2
-        residuals: bool = True,  # S2
-        conv2d_input: bool = False,  # S2
-        pool: bool = False,  # S2
-        h_swish: bool = True,  # S1
-        squeeze_excite: bool = True,  # S1
-        divisor: int = 1,
-        return_layers=None,
+        arch_config: PhiNetArchConfig,
+        config: PhiNetConfig,
+        # Task-specific
+        input_shape: list[int],
+        num_classes: int = 1000,
+        include_top: bool = True,
+        # Training hyperparams 
+        dropout_rate: float = 0.05, # TODO implement, now is an hyperparameter
+        stochastic_depth_prob: float = 0.0, # TODO implement sdp? usually good for training residual nets
     ) -> None:
-        super(PhiNet, self).__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.t_zero = t_zero
-        self.num_layers = num_layers
+        super().__init__()
+        
+        self.alpha = arch_config.alpha
+        self.beta = arch_config.beta
+        self.t_zero = arch_config.t_zero
+        self.num_layers = arch_config.num_layers
         self.num_classes = num_classes
-        self.return_layers = return_layers
+        self.include_top = include_top
+        self.input_shape = input_shape
 
-        if compatibility:  # disables operations hard for some platforms
-            h_swish = False
-            squeeze_excite = False
-
-        # this hyperparameters are hard-coded. Defined here as variables just so
-        # you can play with them.
+        # Base filters configuration
         first_conv_filters = 48
         b1_filters = 24
         b2_filters = 48
-
-        if not isinstance(num_layers, int):
-            num_layers = round(num_layers)
-
+        
         assert len(input_shape) == 3, "Expected 3 elements list as input_shape."
-        in_channels = input_shape[0]
-        res = max(input_shape[1], input_shape[2])  # assumes squared input
-        self.input_shape = input_shape
+        in_channels = int(input_shape[0])
+        H = int(input_shape[1])
+        W = int(input_shape[2])
 
-        self.classify = include_top
-        self._layers = torch.nn.ModuleList()
+        activation = nn.Hardswish(inplace=True) if config.h_swish else ReLUMax(6)
 
-        # Define self.activation function
-        if h_swish:
-            activation = nn.Hardswish(inplace=True)
+        # parse first_conv_stride: can be int or (h,w) tuple. We only use tuple
+        # for the stem convolution; internal block strides remain integer 1 or 2
+        if isinstance(arch_config.first_conv_stride, tuple) or isinstance(arch_config.first_conv_stride, list):
+            first_s_h, first_s_w = int(arch_config.first_conv_stride[0]), int(arch_config.first_conv_stride[1])
         else:
-            activation = ReLUMax(6)
+            first_s_h = first_s_w = int(arch_config.first_conv_stride)
+        
+        # -------------------
+        # Stem stage (configurable, separable vs regular conv)
+        # -------------------
+        if arch_config.use_separable_stem:
+            stem_layers = []
 
-        mp = nn.MaxPool2d((2, 2))
+            # compute correct pad for (H, W) and kernel_size 3
+            pad = nn.ZeroPad2d(padding=correct_pad((H, W), 3))
+            stem_layers.append(pad)
 
-        if not conv2d_input:
-            pad = nn.ZeroPad2d(
-                padding=correct_pad([res, res], 3),
-            )
+            stem_out_channels = _make_divisible(int(first_conv_filters * self.alpha), divisor=config.divisor)
 
-            self._layers.append(pad)
-
+            # SeparableConv2d supports stride as a tuple (we implemented that earlier)
             sep1 = SeparableConv2d(
                 in_channels,
-                _make_divisible(int(first_conv_filters * alpha), divisor=divisor),
+                stem_out_channels,
                 kernel_size=3,
-                stride=(first_conv_stride, first_conv_stride),
+                stride=(first_s_h, first_s_w),
                 padding=0,
                 bias=False,
                 activation=activation,
             )
+            stem_layers.append(sep1)
 
-            self._layers.append(sep1)
-            # self._layers.append(activation)
+            # block1 input spatial size computed from per-axis stem stride
+            block1_h = max(1, H // first_s_h)
+            block1_w = max(1, W // first_s_w)
 
             block1 = PhiNetConvBlock(
                 in_shape=(
-                    _make_divisible(int(first_conv_filters * alpha), divisor=divisor),
-                    res / first_conv_stride,
-                    res / first_conv_stride,
+                    stem_out_channels,
+                    block1_h,
+                    block1_w,
                 ),
-                filters=_make_divisible(int(b1_filters * alpha), divisor=divisor),
+                filters=_make_divisible(int(b1_filters * self.alpha), divisor=config.divisor),
                 stride=1,
                 expansion=1,
                 has_se=False,
-                res=residuals,
-                h_swish=h_swish,
-                divisor=divisor,
+                res=config.residuals,
+                h_swish=config.h_swish,
+                divisor=config.divisor,
             )
+            stem_layers.append(block1)
 
-            self._layers.append(block1)
+            # Track spatial dimensions after stem
+            current_h = block1_h
+            current_w = block1_w
         else:
-            c1 = nn.Conv2d(
-                in_channels, int(b1_filters * alpha), kernel_size=(3, 3), bias=False
-            )
+            # Simple conv stem
+            stem_out = _make_divisible(int(b1_filters * self.alpha), divisor=config.divisor)
+            stem_layers.extend([
+                nn.Conv2d(in_channels, stem_out, kernel_size=3, stride=first_s_h, padding=1, bias=False),
+                nn.BatchNorm2d(stem_out),
+                activation,
+            ])
+            
+            # Track spatial dimensions after stem
+            current_h = max(1, H // first_s_h)
+            current_w = max(1, W // first_s_w)
+        
+        self.stem = nn.Sequential(*stem_layers)
 
-            bn_c1 = nn.BatchNorm2d(int(b1_filters * alpha))
+        # -------------------
+        # Build Feature Layers
+        # -------------------
+        feature_layers = []
+        
+        # Current channel count
+        current_channels = _make_divisible(int(b1_filters * self.alpha), divisor=config.divisor)
 
-            self._layers.append(c1)
-            self._layers.append(activation)
-            self._layers.append(bn_c1)
-
+        # Block 2 (first block in features)
         block2 = PhiNetConvBlock(
-            (
-                _make_divisible(int(b1_filters * alpha), divisor=divisor),
-                res / first_conv_stride,
-                res / first_conv_stride,
-            ),
-            filters=_make_divisible(int(b1_filters * alpha), divisor=divisor),
-            stride=2 if (not pool) else 1,
-            expansion=get_xpansion_factor(t_zero, beta, 1, num_layers),
+            in_shape=(current_channels, current_h, current_w),
+            filters=_make_divisible(int(b1_filters * self.alpha), divisor=config.divisor),
+            stride=2 if not config.pool else 1,
+            expansion=get_xpansion_factor(self.t_zero, self.beta, 1, self.num_layers),
             block_id=1,
-            has_se=squeeze_excite,
-            res=residuals,
-            h_swish=h_swish,
-            divisor=divisor,
+            has_se=config.squeeze_excite,
+            res=config.residuals,
+            h_swish=config.h_swish,
+            divisor=config.divisor,
         )
+        feature_layers.append(block2)
+        
+        if config.pool:
+            feature_layers.append(nn.MaxPool2d((2, 2)))
+        
+        # Update spatial dimensions after first downsample
+        current_h = max(1, current_h // 2)
+        current_w = max(1, current_w // 2)
 
+        # Block 3
         block3 = PhiNetConvBlock(
-            (
-                _make_divisible(int(b1_filters * alpha), divisor=divisor),
-                res / first_conv_stride / 2,
-                res / first_conv_stride / 2,
-            ),
-            filters=_make_divisible(int(b1_filters * alpha), divisor=divisor),
+            in_shape=(current_channels, current_h, current_w),
+            filters=_make_divisible(int(b1_filters * self.alpha), divisor=config.divisor),
             stride=1,
-            expansion=get_xpansion_factor(t_zero, beta, 2, num_layers),
+            expansion=get_xpansion_factor(self.t_zero, self.beta, 2, self.num_layers),
             block_id=2,
-            has_se=squeeze_excite,
-            res=residuals,
-            h_swish=h_swish,
-            divisor=divisor,
+            has_se=config.squeeze_excite,
+            res=config.residuals,
+            h_swish=config.h_swish,
+            divisor=config.divisor,
         )
+        feature_layers.append(block3)
 
+        # Block 4 (transition to b2_filters)
         block4 = PhiNetConvBlock(
-            (
-                _make_divisible(int(b1_filters * alpha), divisor=divisor),
-                res / first_conv_stride / 2,
-                res / first_conv_stride / 2,
-            ),
-            filters=_make_divisible(int(b2_filters * alpha), divisor=divisor),
-            stride=2 if (not pool) else 1,
-            expansion=get_xpansion_factor(t_zero, beta, 3, num_layers),
+            in_shape=(current_channels, current_h, current_w),
+            filters=_make_divisible(int(b2_filters * self.alpha), divisor=config.divisor),
+            stride=2 if not config.pool else 1,
+            expansion=get_xpansion_factor(self.t_zero, self.beta, 3, self.num_layers),
             block_id=3,
-            has_se=squeeze_excite,
-            res=residuals,
-            h_swish=h_swish,
-            divisor=divisor,
+            has_se=config.squeeze_excite,
+            res=config.residuals,
+            h_swish=config.h_swish,
+            divisor=config.divisor,
         )
+        feature_layers.append(block4)
+        
+        if config.pool:
+            feature_layers.append(nn.MaxPool2d((2, 2)))
+        
+        # Update spatial dimensions and channels
+        current_h = max(1, current_h // 2)
+        current_w = max(1, current_w // 2)
+        current_channels = _make_divisible(int(b2_filters * self.alpha), divisor=config.divisor)
 
-        self._layers.append(block2)
-        if pool:
-            self._layers.append(mp)
-        self._layers.append(block3)
-        self._layers.append(block4)
-        if pool:
-            self._layers.append(mp)
-
+        # -------------------
+        # Dynamic blocks (block_id 4 to num_layers)
+        # -------------------
         block_id = 4
         block_filters = b2_filters
-        spatial_res = res / first_conv_stride / 4
-        in_channels_next = _make_divisible(int(b2_filters * alpha), divisor=divisor)
-        while num_layers >= block_id:
-            if block_id in downsampling_layers:
+
+        while block_id <= self.num_layers:
+            # Double filters at downsampling layers
+            if block_id in arch_config.downsampling_layers:
                 block_filters *= 2
-                if pool:
-                    self._layers.append(mp)
+                if config.pool:
+                    feature_layers.append(nn.MaxPool2d((2, 2)))
 
+            # Determine stride for this block
+            block_stride = 2 if (block_id in arch_config.downsampling_layers and not config.pool) else 1
+
+            # Determine kernel size based on position in network
+            k_size = 5 if (block_id / float(self.num_layers)) > (1.0 - float(arch_config.conv5_percent)) else 3
+
+            # Create block
             pn_block = PhiNetConvBlock(
-                (in_channels_next, spatial_res, spatial_res),
-                filters=_make_divisible(int(block_filters * alpha), divisor=divisor),
-                stride=(2 if (block_id in downsampling_layers) and (not pool) else 1),
-                expansion=get_xpansion_factor(t_zero, beta, block_id, num_layers),
+                in_shape=(current_channels, current_h, current_w),
+                filters=_make_divisible(int(block_filters * self.alpha), divisor=config.divisor),
+                stride=block_stride,
+                expansion=get_xpansion_factor(self.t_zero, self.beta, block_id, self.num_layers),
                 block_id=block_id,
-                has_se=squeeze_excite,
-                res=residuals,
-                h_swish=h_swish,
-                k_size=(5 if (block_id / num_layers) > (1 - conv5_percent) else 3),
-                divisor=divisor,
+                has_se=config.squeeze_excite,
+                res=config.residuals,
+                h_swish=config.h_swish,
+                k_size=k_size,
+                divisor=config.divisor,
             )
+            feature_layers.append(pn_block)
 
-            self._layers.append(pn_block)
-            in_channels_next = _make_divisible(
-                int(block_filters * alpha), divisor=divisor
-            )
-            spatial_res = (
-                spatial_res / 2 if block_id in downsampling_layers else spatial_res
-            )
+            # Update state for next block
+            current_channels = _make_divisible(int(block_filters * self.alpha), divisor=config.divisor)
+            if block_stride == 2:
+                current_h = max(1, current_h // 2)
+                current_w = max(1, current_w // 2)
+
             block_id += 1
 
+        self.features = nn.Sequential(*feature_layers)
+
+        # -------------------
+        # Classification Head
+        # -------------------
+
         if include_top:
-            # Includes classification head if required
             self.classifier = nn.Sequential(
                 nn.AdaptiveAvgPool2d((1, 1)),
                 nn.Flatten(),
                 nn.Linear(
-                    _make_divisible(int(block_filters * alpha), divisor=divisor),
+                    _make_divisible(int(block_filters * self.alpha), divisor=config.divisor),
                     num_classes,
                     bias=True,
                 ),
             )
+        else:
+            self.classifier = nn.Identity()
+        
 
-        if self.return_layers is not None:
-            print(f"PhiNet configured to return layers {self.return_layers}:")
-            for i in self.return_layers:
-                print(f"Layer {i} - {self._layers[i].__class__}")
+        
+        if config.init_weights:
+            self._initialize_weights()
 
-    def forward(self, x):
-        """Executes PhiNet network
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Standard forward pass for clean export."""
+        x = self.stem(x)
+        x = self.features(x)
+        return self.classifier(x)
+    
+    def _initialize_weights(self) -> None:
+        """Initialize weights following best practices."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-        Arguments
-        -------
-        x : torch.Tensor
-            Network input.
+    @torch.jit.ignore
+    def get_complexity(self):
+        """Returns MAC and number of parameters of initialized architecture."""
+        temp = summary(
+            self, input_data=torch.zeros([1] + list(self.input_shape)), verbose=0
+        )
+        return {"MAC": temp.total_mult_adds, "params": temp.total_params}
 
-        Returns
-        ------
-            Logits if `include_top=True`, otherwise embeddings : torch.Tensor
-        """
-        ret = []
-        for i, layers in enumerate(self._layers):
-            x = layers(x)
-            if self.return_layers is not None:
-                if i in self.return_layers:
-                    ret.append(x)
+    @torch.jit.ignore
+    def get_MAC(self):
+        """Returns number of MACs for this architecture."""
+        return self.get_complexity()["MAC"]
 
-        if self.classify:
-            x = self.classifier(x)
-
-        if self.return_layers is not None:
-            return x, ret
-        return x
+    @torch.jit.ignore
+    def get_params(self):
+        """Returns number of params for this architecture."""
+        return self.get_complexity()["params"]
+    

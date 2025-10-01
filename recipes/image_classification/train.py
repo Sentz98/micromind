@@ -45,7 +45,6 @@ class ImageClassification(mm.MicroMind):
                 compatibility=False,
                 divisor=hparams.divisor,
                 downsampling_layers=hparams.downsampling_layers,
-                return_layers=hparams.return_layers,
                 # classification-specific
                 include_top=True,
                 num_classes=hparams.num_classes,

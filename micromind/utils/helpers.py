@@ -73,12 +73,18 @@ def parse_configuration(cfg: Union[str, Path]):
 
 
 def get_logger():
-    """Default loguru logger config. It is called inside micromind's files."""
-    fmt = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | \
-            <level>{level: <8}</level> |  \
-            <level>{message}</level>"
-    logger.remove()
-    logger.add(sys.stderr, format=fmt)
+    """Configure and return a Loguru logger instance for the toolkit."""
+    fmt = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>"
+    )
+
+    # Configure only once
+    if not logger._core.handlers:  # prevent re-adding on multiple calls
+        logger.remove()
+        logger.add(sys.stderr, format=fmt, level="DEBUG")  # default log level
 
     return logger
 
