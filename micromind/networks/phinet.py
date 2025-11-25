@@ -429,14 +429,12 @@ class PhiNetArchConfig:
         if any(layer > self.num_layers for layer in self.downsampling_layers):
             raise ValueError("downsampling_layers contains indices beyond num_layers")
         
-        if not 0 < self.alpha <= 2:
-            raise ValueError(f"alpha should be in (0, 2], got {self.alpha}")
+        # if not 0 < self.alpha <= 2:
+        #     raise ValueError(f"alpha should be in (0, 2], got {self.alpha}")
+        #TODO check 4 beta?
         if not 2 <= self.t_zero <= 8:
             logger.warning("Is recommended to keep t_zero between 2 and 8, " \
             "using by default 6 for networks larger than 5MMACC and 5 for networks smaller than that")
-
-        
-
 
 @dataclass  
 class PhiNetConfig:

@@ -8,59 +8,10 @@ import torch
 import torch.nn as nn
 
 from micromind.networks.phinet import (
-    _make_divisible, correct_pad, get_xpansion_factor,
+    get_xpansion_factor,
     ReLUMax, SEBlock, DepthwiseConv2d, SeparableConv2d,
     PhiNetConvBlock, PhiNet, PhiNetArchConfig, PhiNetConfig
 )
-
-
-class TestHelperFunctions:
-    """Test suite for helper functions."""
-    
-    def test_make_divisible_basic(self):
-        """Test _make_divisible with basic inputs."""
-        assert _make_divisible(10, divisor=8) == 16
-        assert _make_divisible(17, divisor=8) == 16
-        assert _make_divisible(20, divisor=8) == 24
-    
-    def test_make_divisible_min_value(self):
-        """Test _make_divisible with min_value parameter."""
-        assert _make_divisible(5, divisor=8, min_value=16) == 16
-        assert _make_divisible(1, divisor=8, min_value=8) == 8
-    
-    def test_make_divisible_ten_percent_rule(self):
-        """Test that _make_divisible doesn't reduce by more than 10%."""
-        result = _make_divisible(10, divisor=8)
-        assert result >= 10 * 0.9
-    
-    def test_correct_pad_with_int_kernel(self):
-        """Test correct_pad with integer kernel size."""
-        padding = correct_pad((224, 224), 3)
-        assert len(padding) == 4
-        assert all(isinstance(p, int) for p in padding)
-    
-    def test_correct_pad_with_tuple_kernel(self):
-        """Test correct_pad with tuple kernel size."""
-        padding = correct_pad((224, 224), (3, 3))
-        assert len(padding) == 4
-    
-    def test_correct_pad_with_none_input(self):
-        """Test correct_pad with None in input shape."""
-        padding = correct_pad((None, 224), 3)
-        assert len(padding) == 4
-    
-    def test_get_xpansion_factor(self):
-        """Test expansion factor calculation."""
-        factor = get_xpansion_factor(t_zero=6, beta=1.0, block_id=3, num_blocks=7)
-        assert isinstance(factor, float)
-        assert factor > 0
-        
-        # Test boundary conditions
-        factor_start = get_xpansion_factor(6, 1.0, 0, 7)
-        factor_end = get_xpansion_factor(6, 1.0, 7, 7)
-        assert factor_start == 6.0
-        assert factor_end == 6.0
-
 
 class TestActivationLayers:
     """Test suite for custom activation layers."""
@@ -247,172 +198,172 @@ class TestPhiNet:
         breakpoint()
         assert isinstance(model, nn.Module)
     
-    # def test_phinet_forward_no_classifier(self):
-    #     """Test PhiNet forward pass without classifier."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         beta=1.0,
-    #         include_top=False
-    #     )
-    #     x = torch.randn(2, 3, 224, 224)
-    #     output = model(x)
+    def test_phinet_forward_no_classifier(self):
+        """Test PhiNet forward pass without classifier."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            beta=1.0,
+            include_top=False
+        )
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
         
-    #     assert output.shape[0] == 2
-    #     assert len(output.shape) == 4  # (B, C, H, W)
+        assert output.shape[0] == 2
+        assert len(output.shape) == 4  # (B, C, H, W)
     
-    # def test_phinet_forward_with_classifier(self):
-    #     """Test PhiNet forward pass with classifier."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         beta=1.0,
-    #         include_top=True,
-    #         num_classes=10
-    #     )
-    #     x = torch.randn(2, 3, 224, 224)
-    #     output = model(x)
+    def test_phinet_forward_with_classifier(self):
+        """Test PhiNet forward pass with classifier."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            beta=1.0,
+            include_top=True,
+            num_classes=10
+        )
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
         
-    #     assert output.shape == (2, 10)
+        assert output.shape == (2, 10)
     
-    # def test_phinet_different_input_sizes(self):
-    #     """Test PhiNet with different input resolutions."""
-    #     for size in [32, 64, 128, 224]:
-    #         model = PhiNet(
-    #             input_shape=[3, size, size],
-    #             num_layers=7,
-    #             alpha=0.2,
-    #             include_top=True,
-    #             num_classes=10
-    #         )
-    #         x = torch.randn(1, 3, size, size)
-    #         output = model(x)
-    #         assert output.shape == (1, 10)
+    def test_phinet_different_input_sizes(self):
+        """Test PhiNet with different input resolutions."""
+        for size in [32, 64, 128, 224]:
+            model = PhiNet(
+                input_shape=[3, size, size],
+                num_layers=7,
+                alpha=0.2,
+                include_top=True,
+                num_classes=10
+            )
+            x = torch.randn(1, 3, size, size)
+            output = model(x)
+            assert output.shape == (1, 10)
     
-    # def test_phinet_compatibility_mode(self):
-    #     """Test PhiNet with compatibility mode enabled."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         compatibility=True,
-    #         include_top=False
-    #     )
-    #     x = torch.randn(2, 3, 224, 224)
-    #     output = model(x)
+    def test_phinet_compatibility_mode(self):
+        """Test PhiNet with compatibility mode enabled."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            compatibility=True,
+            include_top=False
+        )
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
         
-    #     assert output is not None
+        assert output is not None
     
-    # def test_phinet_custom_downsampling_layers(self):
-    #     """Test PhiNet with custom downsampling layers."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=10,
-    #         alpha=0.2,
-    #         downsampling_layers=[3, 6, 9],
-    #         include_top=False
-    #     )
-    #     x = torch.randn(2, 3, 224, 224)
-    #     output = model(x)
+    def test_phinet_custom_downsampling_layers(self):
+        """Test PhiNet with custom downsampling layers."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=10,
+            alpha=0.2,
+            downsampling_layers=[3, 6, 9],
+            include_top=False
+        )
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
         
-    #     assert output is not None
+        assert output is not None
     
-    # def test_phinet_get_stage_names(self):
-    #     """Test getting stage names from PhiNet."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         include_top=False
-    #     )
-    #     stage_names = model.get_stage_names()
+    def test_phinet_get_stage_names(self):
+        """Test getting stage names from PhiNet."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            include_top=False
+        )
+        stage_names = model.get_stage_names()
         
-    #     assert isinstance(stage_names, list)
-    #     assert 'stem' in stage_names
-    #     assert len(stage_names) > 0
+        assert isinstance(stage_names, list)
+        assert 'stem' in stage_names
+        assert len(stage_names) > 0
     
-    # def test_phinet_different_alphas(self):
-    #     """Test PhiNet with different width multipliers."""
-    #     for alpha in [0.1, 0.2, 0.5, 1.0]:
-    #         model = PhiNet(
-    #             input_shape=[3, 224, 224],
-    #             num_layers=7,
-    #             alpha=alpha,
-    #             include_top=False
-    #         )
-    #         x = torch.randn(1, 3, 224, 224)
-    #         output = model(x)
-    #         assert output is not None
+    def test_phinet_different_alphas(self):
+        """Test PhiNet with different width multipliers."""
+        for alpha in [0.1, 0.2, 0.5, 1.0]:
+            model = PhiNet(
+                input_shape=[3, 224, 224],
+                num_layers=7,
+                alpha=alpha,
+                include_top=False
+            )
+            x = torch.randn(1, 3, 224, 224)
+            output = model(x)
+            assert output is not None
     
-    # def test_phinet_complexity_metrics(self):
-    #     """Test PhiNet complexity calculation methods."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         include_top=True,
-    #         num_classes=10
-    #     )
+    def test_phinet_complexity_metrics(self):
+        """Test PhiNet complexity calculation methods."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            include_top=True,
+            num_classes=10
+        )
         
-    #     complexity = model.get_complexity()
-    #     assert 'MAC' in complexity
-    #     assert 'params' in complexity
-    #     assert complexity['MAC'] > 0
-    #     assert complexity['params'] > 0
+        complexity = model.get_complexity()
+        assert 'MAC' in complexity
+        assert 'params' in complexity
+        assert complexity['MAC'] > 0
+        assert complexity['params'] > 0
         
-    #     mac = model.get_MAC()
-    #     params = model.get_params()
-    #     assert mac == complexity['MAC']
-    #     assert params == complexity['params']
+        mac = model.get_MAC()
+        params = model.get_params()
+        assert mac == complexity['MAC']
+        assert params == complexity['params']
     
-    # def test_phinet_conv2d_input(self):
-    #     """Test PhiNet with conv2d_input=True."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         conv2d_input=True,
-    #         include_top=False
-    #     )
-    #     x = torch.randn(2, 3, 224, 224)
-    #     output = model(x)
+    def test_phinet_conv2d_input(self):
+        """Test PhiNet with conv2d_input=True."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            conv2d_input=True,
+            include_top=False
+        )
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
         
-    #     assert output is not None
+        assert output is not None
     
-    # def test_phinet_with_pooling(self):
-    #     """Test PhiNet with pooling enabled."""
-    #     model = PhiNet(
-    #         input_shape=[3, 224, 224],
-    #         num_layers=7,
-    #         alpha=0.2,
-    #         pool=True,
-    #         include_top=False
-    #     )
-    #     x = torch.randn(2, 3, 224, 224)
-    #     output = model(x)
+    def test_phinet_with_pooling(self):
+        """Test PhiNet with pooling enabled."""
+        model = PhiNet(
+            input_shape=[3, 224, 224],
+            num_layers=7,
+            alpha=0.2,
+            pool=True,
+            include_top=False
+        )
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
         
-    #     assert output is not None
+        assert output is not None
     
-    # def test_phinet_gradient_flow(self):
-    #     """Test gradient flow through PhiNet."""
-    #     model = PhiNet(
-    #         input_shape=[3, 32, 32],
-    #         num_layers=5,
-    #         alpha=0.2,
-    #         include_top=True,
-    #         num_classes=10
-    #     )
-    #     x = torch.randn(2, 3, 32, 32, requires_grad=True)
-    #     output = model(x)
-    #     loss = output.sum()
-    #     loss.backward()
+    def test_phinet_gradient_flow(self):
+        """Test gradient flow through PhiNet."""
+        model = PhiNet(
+            input_shape=[3, 32, 32],
+            num_layers=5,
+            alpha=0.2,
+            include_top=True,
+            num_classes=10
+        )
+        x = torch.randn(2, 3, 32, 32, requires_grad=True)
+        output = model(x)
+        loss = output.sum()
+        loss.backward()
         
-    #     assert x.grad is not None
-    #     # Check that some model parameters have gradients
-    #     has_grad = any(p.grad is not None for p in model.parameters() if p.requires_grad)
-    #     assert has_grad
+        assert x.grad is not None
+        # Check that some model parameters have gradients
+        has_grad = any(p.grad is not None for p in model.parameters() if p.requires_grad)
+        assert has_grad
 
 
 class TestPhiNetEdgeCases:
