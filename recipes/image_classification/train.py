@@ -15,12 +15,16 @@ Authors:
 
 import torch
 import torch.nn as nn
-from prepare_data import create_loaders, setup_mixup
+from prepare_data import ImageDataModule, setup_mixup
 from timm.loss import (
     BinaryCrossEntropy,
     LabelSmoothingCrossEntropy,
     SoftTargetCrossEntropy,
 )
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from torchmetrics import Accuracy
 
 import micromind as mm
 from micromind.networks import PhiNet, XiNet
@@ -29,14 +33,17 @@ import sys
 
 
 class ImageClassification(mm.MicroMind):
-    """Implements an image classification class. Provides support
-    for timm augmentation and loss functions."""
+    """
+    Implements an image classification class.
+    Provides support for timm augmentation and loss functions.
+    """
 
     def __init__(self, hparams, *args, **kwargs):
         super().__init__(hparams, *args, **kwargs)
 
+        # Build model
         if hparams.model == "phinet":
-            self.modules["classifier"] = PhiNet(
+            self.modules_dict["classifier"] = PhiNet(
                 input_shape=hparams.input_shape,
                 alpha=hparams.alpha,
                 num_layers=hparams.num_layers,
@@ -51,24 +58,21 @@ class ImageClassification(mm.MicroMind):
                 num_classes=hparams.num_classes,
             )
         elif hparams.model == "xinet":
-            self.modules["classifier"] = XiNet(
+            self.modules_dict["classifier"] = XiNet(
                 input_shape=hparams.input_shape,
                 alpha=hparams.alpha,
                 gamma=hparams.gamma,
                 num_layers=hparams.num_layers,
                 return_layers=hparams.return_layers,
-                # classification-specific
                 include_top=True,
                 num_classes=hparams.num_classes,
             )
 
         self.mixup_fn, _ = setup_mixup(hparams)
+        self.criterion = self.setup_criterion()
 
-        print("Number of parameters for each module:")
-        print(self.compute_params())
-
-        print("Number of MAC for each module:")
-        print(self.compute_macs(hparams.input_shape))
+        self.compute_params() # Number of parameters
+        self.compute_macs(hparams.input_shape) # Number of MACs
 
     def setup_criterion(self):
         """Setup of the loss function based on augmentation strategy."""
@@ -102,7 +106,8 @@ class ImageClassification(mm.MicroMind):
         return train_loss_fn
 
     def forward(self, batch):
-        """Computes forward step for image classifier.
+        """
+        Computes forward step for image classifier.
 
         Arguments
         ---------
@@ -114,15 +119,16 @@ class ImageClassification(mm.MicroMind):
         Predicted class and augmented class. : Tuple[torch.Tensor, torch.Tensor]
         """
         img, target = batch
-        if not self.hparams.prefetcher:
-            img, target = img.to(self.device), target.to(self.device)
-            if self.mixup_fn is not None:
-                img, target = self.mixup_fn(img, target)
+        
+        # Apply mixup if available and in training mode
+        if self.mixup_fn is not None and self.training:
+            img, target = self.mixup_fn(img, target)
 
-        return (self.modules["classifier"](img), target)
+        return (self.modules_dict["classifier"](img), target)
 
     def compute_loss(self, pred, batch):
-        """Sets up the loss function and computes the criterion.
+        """
+        Computes the loss function.
 
         Arguments
         ---------
@@ -135,71 +141,98 @@ class ImageClassification(mm.MicroMind):
         -------
         Cost function. : torch.Tensor
         """
-        self.criterion = self.setup_criterion()
 
         # taking it from pred because it might be augmented
         return self.criterion(pred[0], pred[1])
 
     def configure_optimizers(self):
-        """Configures the optimizes and, eventually the learning rate scheduler."""
-        opt = torch.optim.Adam(self.modules.parameters(), lr=3e-4, weight_decay=0.0005)
-        return opt
+        """Configures the optimizer and learning rate scheduler."""
+        lr = getattr(self.hparams, 'lr', 3e-4)
+        weight_decay = getattr(self.hparams, 'weight_decay', 0.0005)
+        
+        opt = torch.optim.Adam(
+            self.parameters(), 
+            lr=lr, 
+            weight_decay=weight_decay
+        )
+        
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=self.hparams.epochs
+        )
+        return {
+            'optimizer': opt,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+            }
+        }
 
-
-def top_k_accuracy(k=1):
-    """
-    Computes the top-K accuracy.
-
-    Arguments
-    ---------
-    k : int
-       Number of top elements to consider for accuracy.
-
-    Returns
-    -------
-        accuracy : Callable
-            Top-K accuracy.
-    """
-
-    def acc(pred, batch):
-        if pred[1].ndim == 2:
-            target = pred[1].argmax(1)
-        else:
-            target = pred[1]
-        _, indices = torch.topk(pred[0], k, dim=1)
-        correct = torch.sum(indices == target.view(-1, 1))
-        accuracy = correct.item() / target.size(0)
-
-        return torch.Tensor([accuracy]).to(pred[0].device)
-
-    return acc
-
+# ==============================================================================
+# TRAINING SCRIPT
+# ==============================================================================
 
 if __name__ == "__main__":
     assert len(sys.argv) > 1, "Please pass the configuration file to the script."
     hparams = parse_configuration(sys.argv[1])
 
-    train_loader, val_loader = create_loaders(hparams)
+    # Create the LightningDataModule
+    datamodule = ImageDataModule(hparams)
 
+    # Create experiment folder
     exp_folder = mm.utils.checkpointer.create_experiment_folder(
         hparams.output_folder, hparams.experiment_name
     )
 
-    checkpointer = mm.utils.checkpointer.Checkpointer(
-        exp_folder, hparams=hparams, key="loss"
+    # Setup Lightning callbacks
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=exp_folder,
+        filename='{epoch}-{val_loss:.2f}',
+        monitor='val_loss',
+        mode='min',
+        save_top_k=3,
+        save_last=True,
+        verbose=True,
     )
 
+    # Setup logger
+    tb_logger = TensorBoardLogger(
+        save_dir=hparams.output_folder,
+        name=hparams.experiment_name,
+    )
+
+    # Initialize model
     mind = ImageClassification(hparams=hparams)
 
-    top1 = mm.Metric("top1_acc", top_k_accuracy(k=1), eval_only=True)
-    top5 = mm.Metric("top5_acc", top_k_accuracy(k=5), eval_only=True)
-
-    mind.train(
-        epochs=hparams.epochs,
-        datasets={"train": train_loader, "val": val_loader},
-        metrics=[top5, top1],
-        checkpointer=checkpointer,
-        debug=hparams.debug,
+    # Basic accuracy
+    mind.add_metric(
+        'acc',
+        Accuracy(task='multiclass', num_classes=hparams.num_classes),
+        stage='all'
     )
 
-    mind.test(datasets={"test": val_loader}, metrics=[top1, top5])
+    # Create Lightning Trainer
+    trainer = pl.Trainer(
+        max_epochs=hparams.epochs,
+        accelerator='auto',  # Automatically selects GPU if available
+        devices='auto',      # Uses all available devices
+        precision=getattr(hparams, 'precision', '32'),  # Use 16-mixed for mixed precision
+        callbacks=[checkpoint_callback],
+        logger=tb_logger,
+        enable_progress_bar=True,
+        log_every_n_steps=50,
+        deterministic=False,
+        fast_dev_run=hparams.debug,  # Run only 1 batch if debug mode
+    )
+
+    # Train the model
+    trainer.fit(mind, datamodule=datamodule)
+
+    # Test the model
+    trainer.test(mind, datamodule=datamodule)
+
+    # Optional: Load best checkpoint and test
+    best_model = ImageClassification.load_from_checkpoint(
+        checkpoint_callback.best_model_path,
+        hparams=hparams
+    )
+    trainer.test(best_model, datamodule=datamodule)

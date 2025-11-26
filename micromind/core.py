@@ -1,681 +1,519 @@
 """
 Core class for micromind. Supports helper function for exports. Out-of-the-box
-multi-gpu and FP16 training with HF Accelerate and much more.
+multi-gpu and FP16 training with PyTorch Lightning and much more.
 
 Authors:
     - Francesco Paissan, 2023
+    - Gabriele Santini, 2025
 """
-from abc import ABC, abstractmethod
-from argparse import Namespace
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
-from accelerate import DistributedDataParallelKwargs
-from torchinfo import summary
 
-import torch
-from accelerate import Accelerator
-from tqdm import tqdm
+from abc import abstractmethod
+from argparse import Namespace
+from pathlib import Path
+from typing import List, Optional, Tuple, Union, Callable, Dict, Any
 import warnings
 
+import torch
+import pytorch_lightning as pl
+from torchinfo import summary
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+
+from torchmetrics import Metric as TorchMetric, MetricCollection
+from .utils.metric import CustomMetric
+
 from .utils.helpers import get_logger
-from .utils.checkpointer import Checkpointer
 
 logger = get_logger()
 
-# This is used ONLY if you are not using argparse to get the hparams
+# Default configuration
 default_cfg = {
     "output_folder": "results",
     "experiment_name": "micromind_exp",
-    "opt": "adam",  # this is ignored if you are overriding the configure_optimizers
-    "lr": 0.001,  # this is ignored if you are overriding the configure_optimizers
+    "opt": "adam",
+    "lr": 0.001,
     "debug": False,
 }
 
 
-@dataclass
-class Stage:
-    """enum to track training stage"""
-
-    train: int = 0
-    val: int = 1
-    test: int = 2
-
-
-class Metric:
+class MicroMind(pl.LightningModule):
     """
-    Class for tracking evaluation metrics during training.
-
-    This class allows you to create custom evaluation metrics by providing a
-    function to compute the metric and specifying a reduction method.
-
-    Arguments
-    ---------
-        name : str
-            The name of the metric.
-        fn : Callable
-            A function that computes the metric given predictions and batch data.
-        reduction : Optional[str]
-            The reduction method for the metric ('sum' or 'mean'). Default is 'mean'.
-
-    Returns
-    -------
-        Reduced metric. Optionally, you can access the metric history
-        before call reduce(clear=True) : torch.Tensor
-
-    Example
-    -------
-    .. doctest::
-
-        >>> from micromind import Metric, Stage
-        >>> import torch
-
-        >>> def custom_metric(pred, batch):
-        ...     # Replace this with your custom metric calculation
-        ...     return pred - batch
-
-        >>> metric = Metric("Custom Metric", custom_metric, reduction="mean")
-        >>> pred = torch.tensor([1.0, 2.0, 3.0])
-        >>> batch = torch.tensor([0.5, 1.5, 2.5])
-        >>> metric(pred, batch, stage=Stage.train)
-        >>> metric.history
-        {0: [tensor([0.5000, 0.5000, 0.5000])], 1: [], 2: []}
-        >>> metric.reduce(Stage.train)
-        0.5
-    """
-
-    def __init__(
-        self,
-        name: str,
-        fn: Callable,
-        reduction: Optional[str] = "mean",
-        eval_only: Optional[bool] = False,
-        eval_period: Optional[int] = 1,
-    ):
-        self.name = name
-        self.fn = fn
-        self.reduction = reduction
-        self.eval_only = eval_only
-        self.eval_period = eval_period
-
-        self.history = {s: [] for s in [Stage.train, Stage.val, Stage.test]}
-
-    def __call__(self, pred, batch, stage, device="cpu"):
-        dat = self.fn(pred, batch)
-        if dat.ndim == 0:
-            dat = dat.unsqueeze(0)
-
-        self.history[stage].append(dat)
-
-    def reduce(self, stage, clear=False):
-        """
-        Compute and return the metric for a given prediction and batch data.
-
-        Arguments
-        ---------
-            pred : torch.Tensor
-                The model's prediction.
-            batch : torch.Tensor
-                The ground truth or target values.
-            stage : Stage
-                The current stage (e.g., Stage.train).
-            device Optional[str]
-                The device on which to perform the computation. Default is 'cpu'.
-        """
-
-        if self.reduction == "mean":
-            tmp = torch.cat(self.history[stage], dim=0).mean()
-        elif self.reduction == "sum":
-            tmp = torch.cat(self.history[stage], dim=0).sum()
-
-        if clear:
-            self.history[stage] = []
-
-        return tmp.item()
-
-
-class MicroMind(ABC):
-    """
-    MicroMind is an abstract base class for creating and training deep learning
-    models. Handles training on multi-gpu via accelerate (using DDP and other
-    distributed training strategies). It automatically handles the device
-    management for the training and the micromind's export capabilities to onnx,
-    OpenVino and TFLite.
-
+    MicroMind refactored with PyTorch Lightning as backbone.
+    
+    This is a general-purpose base class that can be extended for any task:
+    classification, detection, segmentation, generation, etc.
+    
+    Key Design Principles:
+    - Task-agnostic: No assumptions about data format or task type
+    - Modular: Uses modules_dict for flexible network composition
+    - Scalable: Built-in multi-GPU, mixed precision, distributed training
+    - Extensible: Override only what you need for your specific task
     Arguments
     ---------
         hparams : Optional[Namespace]
             Hyperparameters for the model. Default is None.
-
     """
-
+    
     def __init__(self, hparams=None):
+        super().__init__()
+        
         if hparams is None:
             hparams = Namespace(**default_cfg)
-
-        # here we should handle devices etc.
-        self.modules = torch.nn.ModuleDict({})  # init empty modules dict
-        self.hparams = hparams
+        
+        # Lightning automatically saves hparams
+        if isinstance(hparams, Namespace):
+            self.save_hyperparameters(vars(hparams))
+        else:
+            self.save_hyperparameters(hparams)
+        
+        # Use 'modules_dict' to avoid conflict with nn.Module.modules()
+        self.modules_dict = torch.nn.ModuleDict({})
         self.input_shape = None
-
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        self.accelerator = Accelerator(ddp_kwargs)
-        self.device = self.accelerator.device
-
-        self.current_epoch = 0
+        
+        # Initialize metric collections for each stage
+        self.train_metrics = MetricCollection({}, prefix='train_')
+        self.val_metrics = MetricCollection({}, prefix='val_')
+        self.test_metrics = MetricCollection({}, prefix='test_')
+        
+        # TODO CHECK Flag to control automatic metric computation
+        # Set to False if you want to handle metrics manually in your subclass
+        self._auto_compute_metrics = True
 
     @abstractmethod
     def forward(self, batch):
         """
-        Forward step of the class. It gets called during inference and optimization.
+        Forward step of the class. Called during inference and training.
         This method should be overwritten for specific applications.
 
         Arguments
         ---------
-            batch : torch.Tensor
+            batch : Any
                 Batch as output from the defined DataLoader.
+                Could be a tensor, tuple, list, dict - depends on your task.
 
         Returns
         -------
-            pred : Union[torch.Tensor, Tuple]
-                Predictions - this depends on the task.
+            pred : Any
+                Predictions - completely task-dependent.
+                Return whatever makes sense for your task.
         """
         pass
 
     @abstractmethod
     def compute_loss(self, pred, batch):
         """
-        Computes the cost function for the optimization process.  It return a
-        tensor on which backward() is called. This method should be overwritten
-        for the specific application.
+        Computes the loss function for optimization.
+        
+        This method MUST be implemented.
+        It gives you complete control over how loss is computed for your task.
 
         Arguments
         ---------
-            pred : Union[torch.Tensor, Tuple]
-                Output of the forward() function
-            batch : torch.Tensor
-                Batch as defined from the DataLoader.
+            pred : Any
+                Output of the forward() function - task-dependent
+            batch : Any
+                Batch as defined from the DataLoader - task-dependent
 
         Returns
         -------
             loss : torch.Tensor
-                Compute cost function.
+                Computed loss value (scalar tensor).
         """
         pass
 
-    def set_input_shape(self, input_shape: Tuple = (3, 224, 224)):
-        """Setter function for input_shape.
-
+    def compute_metrics(self, pred, batch, stage: str) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Compute metrics for the current batch with automatic format detection.
+        
+        This method tries to intelligently extract predictions and targets from
+        common formats. Override for complex custom behavior.
+        
+        Supported formats:
+        - pred is tuple/list: (predictions, targets) 
+        - pred is dict: {'preds': ..., 'targets': ...} or {'logits': ..., 'labels': ...}
+        - batch is tuple/list: extracts targets from batch[1]
+        
         Arguments
         ---------
-        input_shape : Tuple
-            Input shape of the forward step.
+            pred : Any
+                Output from forward() - task-dependent format
+            batch : Any
+                Input batch - task-dependent format
+            stage : str
+                Current stage: 'train', 'val', or 'test'
+                
+        Returns
+        -------
+            metrics : Optional[Dict[str, torch.Tensor]]
+                Dictionary of computed metrics, or None if no metrics to compute
+        """
+        # Get the appropriate metric collection
+        metric_collection = getattr(self, f'{stage}_metrics')
+        
+        # If no metrics registered, skip computation
+        if len(metric_collection) == 0:
+            return None
+        
+        # Try to extract predictions and targets intelligently
+        preds, targets = self._extract_preds_targets(pred, batch)
+        
+        if preds is None or targets is None:
+            # Cannot extract predictions/targets automatically
+            # User needs to override this method for their specific format
+            return None
+        
+        # Update metrics
+        metrics = metric_collection(preds, targets)
+        
+        return metrics
+    
+    def _extract_preds_targets(
+        self, 
+        pred, 
+        batch
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Extract predictions and targets from various common formats.
+        
+        This is a helper method that handles common data structures.
+        Override this method if you have a custom format that doesn't fit
+        these patterns.
+        
+        Arguments
+        ---------
+            pred : Any
+                Predictions from forward()
+            batch : Any
+                Input batch
+                
+        Returns
+        -------
+            preds : Optional[torch.Tensor]
+                Extracted predictions, or None if extraction failed
+            targets : Optional[torch.Tensor]
+                Extracted targets, or None if extraction failed
+        """
+        preds = None
+        targets = None
+        
+        # Case 1: pred is a tuple/list with (predictions, targets)
+        if isinstance(pred, (tuple, list)) and len(pred) >= 2:
+            preds, targets = pred[0], pred[1]
+        
+        # Case 2: pred is a dict with prediction/target keys
+        elif isinstance(pred, dict):
+            # Try common key names for predictions
+            preds = pred.get('preds') or pred.get('predictions') or pred.get('logits') or pred.get('output')
+            # Try common key names for targets
+            targets = pred.get('targets') or pred.get('labels') or pred.get('target') or pred.get('label')
+        
+        # Case 3: pred is just predictions, targets in batch
+        elif torch.is_tensor(pred):
+            preds = pred
+            # Try to extract targets from batch
+            if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                targets = batch[1]
+            elif isinstance(batch, dict):
+                targets = batch.get('targets') or batch.get('labels') or batch.get('target') or batch.get('label')
+        
+        return preds, targets
 
+    def add_metric(
+        self,
+        name: str,
+        metric: Union[TorchMetric, Callable],
+        stage: str = 'all'
+    ):
+        """
+        Add a metric for tracking during training/validation/testing.
+        
+        Supports both TorchMetrics instances and custom functions. Custom functions
+        are automatically wrapped in CustomMetric for proper state management.
+        
+        Arguments
+        ---------
+            name : str
+                Name of the metric (will be prefixed with stage name, e.g., 'val_acc')
+            metric : Union[TorchMetric, Callable]
+                Either:
+                - A TorchMetric instance (recommended)
+                - A callable function(preds, targets) -> scalar (for custom metrics)
+            stage : str
+                Which stage to track metric: 'train', 'val', 'test', or 'all'
+                Default: 'all'
+        
+        """
+        # Wrap callable functions in CustomMetric
+        if callable(metric) and not isinstance(metric, TorchMetric):
+            logger.info(
+                f"Wrapping custom function '{name}' in CustomMetric. "
+                f"Consider using TorchMetrics for better performance."
+            )
+            metric = CustomMetric(metric)
+        
+        # Validate it's now a TorchMetric
+        if not isinstance(metric, TorchMetric):
+            raise TypeError(
+                f"Metric must be a TorchMetric or callable, got {type(metric)}"
+            )
+        
+        # Add to appropriate stages
+        stages = ['train', 'val', 'test'] if stage == 'all' else [stage]
+        
+        for s in stages:
+            if s not in ['train', 'val', 'test']:
+                raise ValueError(f"Invalid stage '{s}'. Must be 'train', 'val', 'test', or 'all'")
+            
+            metric_collection = getattr(self, f'{s}_metrics')
+            
+            # Clone metric to avoid sharing state between stages
+            metric_collection.add_metrics({name: metric.clone()})
+            
+            logger.debug(f"Added metric '{name}' to {s} stage")
+
+    def training_step(self, batch, batch_idx):
+        """
+        Lightning training step - called for each training batch.
+        
+        This method is task-agnostic and delegates to your implementations
+        of forward(), compute_loss(), and compute_metrics().
+        """
+        pred = self(batch)
+        loss = self.compute_loss(pred, batch)
+        
+        # Log loss
+        self.log('train_loss', loss, on_step=True, on_epoch=True, 
+                 prog_bar=True, sync_dist=True)
+        
+        # Compute metrics if implemented
+        if self._auto_compute_metrics:
+            metrics = self.compute_metrics(pred, batch, stage='train')
+            if metrics is not None:
+                self.log_dict(metrics, on_step=False, on_epoch=True, sync_dist=True)
+        
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        """
+        Lightning validation step - called for each validation batch.
+        
+        This method is task-agnostic and delegates to your implementations
+        of forward(), compute_loss(), and compute_metrics().
+        """
+        pred = self(batch)
+        loss = self.compute_loss(pred, batch)
+        
+        # Log loss
+        self.log('val_loss', loss, on_step=False, on_epoch=True, 
+                 prog_bar=True, sync_dist=True)
+        
+        # Compute metrics if implemented
+        if self._auto_compute_metrics:
+            metrics = self.compute_metrics(pred, batch, stage='val')
+            if metrics is not None:
+                self.log_dict(metrics, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        """
+        Lightning test step - called for each test batch.
+        
+        This method is task-agnostic and delegates to your implementations
+        of forward(), compute_loss(), and compute_metrics().
+        """
+        pred = self(batch)
+        loss = self.compute_loss(pred, batch)
+        
+        self.log('test_loss', loss, on_epoch=True, sync_dist=True)
+        
+        # Compute metrics if implemented
+        if self._auto_compute_metrics:
+            metrics = self.compute_metrics(pred, batch, stage='test')
+            if metrics is not None:
+                self.log_dict(metrics, on_epoch=True, sync_dist=True)
+        
+        return loss
+
+    def configure_optimizers(self):
+        """
+        Configure optimizer and optional learning rate scheduler.
+        
+        Override this method to customize optimization. By default uses Adam
+        with learning rate from hparams.
+        
+        Returns
+        -------
+            optimizer : torch.optim.Optimizer
+                Or dict with 'optimizer' and optionally 'lr_scheduler'
+        """
+        opt_name = getattr(self.hparams, 'opt', 'adam')
+        lr = getattr(self.hparams, 'lr', 0.001)
+        
+        if opt_name == "adam":
+            optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        elif opt_name == "sgd":
+            optimizer = torch.optim.SGD(self.parameters(), lr=lr)
+        else:
+            raise ValueError(f"Optimizer {opt_name} not supported.")
+        
+        return optimizer
+    
+    def set_input_shape(self, input_shape: Tuple):
+        """
+        Set input shape needed for export and MAC computation.
+        
+        Arguments
+        ---------
+            input_shape : Tuple
+                Input tensor shape (without batch dimension)
         """
         self.input_shape = input_shape
-        self.modules.input_shape = input_shape
 
     def load_modules(self, checkpoint_path: Union[Path, str]):
-        """Loads models for path.
-
+        """
+        Load model from checkpoint (compatible with original API).
+        
         Arguments
         ---------
-        checkpoint_path : Union[Path, str]
-            Path to the checkpoint where the modules are stored.
-
+            checkpoint_path : Union[Path, str]
+                Path to the checkpoint file.
         """
-        dat = torch.load(checkpoint_path, map_location="cpu")
-
-        modules_keys = list(self.modules.keys())
-        for k in self.modules:
-            try:
-                self.modules[k].load_state_dict(dat[k])
-            except Exception as e:  # maybe saved with DDP
-                tmp = f""" There was a problem loading the checkpoint...
-                    Maybe trained with DDP... trying to load it anyways.
-                    Errow was {type(e).__name__}.
-                    """
-                warnings.warn(" ".join(tmp.split()))
-
-                self.modules[k] = torch.nn.DataParallel(self.modules[k])
-                self.modules[k].load_state_dict(dat[k])
-                self.modules[k] = self.modules[k].module
-
-            logger.info("Successfully loaded model from checkpoint.")
-
-            modules_keys.remove(k)
-
-        if len(modules_keys) != 0:
-            logger.info(f"Couldn't find a state_dict for modules {modules_keys}.")
+        # TODO check support both Lightning and original micromind checkpoint formats
+        try:
+            # Try Lightning format first
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            if 'state_dict' in checkpoint:
+                self.load_state_dict(checkpoint['state_dict'])
+            else:
+                # Original format - load modules_dict modules
+                for k in self.modules_dict:
+                    if k in checkpoint:
+                        self.modules_dict[k].load_state_dict(checkpoint[k])
+            logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
+        except Exception as e:
+            logger.error(f"Error loading checkpoint: {e}")
+            raise
 
     def export(
         self,
         save_dir: Union[Path, str],
         out_format: Optional[str] = "onnx",
-        input_shape: Optional[str] = None,
+        input_shape: Optional[Tuple] = None,
         qbatch: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Export the model to a specified format for deployment.
-        TFLite and OpenVINO need a Linux machine to be exported.
-
 
         Arguments
         ---------
-        save_dir : Union[Path, str]
-            The directory where the exported model will be saved.
-        out_format : Optional[str]
-            The format for exporting the model. Default is 'onnx'.
-        input_shape : Optional[Tuple]
-            The input shape of the model. If not provided, the input shape
-            specified during model creation is used.
-        qbatch : Optional[torch.Tensor]
-            Optional tensor used for PTQ using TFLite. Channels dimension is
-            permuted automatically.
-
+            save_dir : Union[Path, str]
+                The directory where the exported model will be saved.
+            out_format : Optional[str]
+                The format for exporting ('onnx', 'openvino', 'tflite').
+            input_shape : Optional[Tuple]
+                The input shape of the model.
+            qbatch : Optional[torch.Tensor]
+                Optional tensor used for PTQ using TFLite.
         """
         from micromind import convert
-
-        if qbatch is not None:
-            if out_format != "tflite":
-                raise AssertionError("Can perform quantization only on TFLite models.")
+        
+        if qbatch is not None and out_format != "tflite":
+            raise AssertionError("Can perform quantization only on TFLite models.")
+        
         if not isinstance(save_dir, Path):
             save_dir = Path(save_dir)
-        save_dir = save_dir.joinpath(self.hparams.experiment_name)
-
-        self.set_input_shape(input_shape)
-        assert (
-            self.input_shape is not None
-        ), "You should pass the input_shape of the model."
-        self.add_forward_to_modules()
-
+        
+        exp_name = getattr(self.hparams, 'experiment_name', 'micromind_exp')
+        save_dir = save_dir.joinpath(exp_name)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        if input_shape is not None:
+            self.set_input_shape(input_shape)
+        
+        assert self.input_shape is not None, "Must specify input_shape for export"
+        
+        # Put model in eval mode for export
+        self.eval()
+        
+        # TODO check if i have to export self (the Lightning module) or like befor the self.modules_dict
         if out_format == "onnx":
-            convert.convert_to_onnx(self.modules, save_dir.joinpath("model.onnx"))
+            convert.convert_to_onnx(self, save_dir.joinpath("model.onnx"))
         elif out_format == "openvino":
-            convert.convert_to_openvino(self.modules, save_dir)
+            convert.convert_to_openvino(self, save_dir)
         elif out_format == "tflite":
-            qbatch = qbatch.permute(0, 3, 2, 1)
-            convert.convert_to_tflite(self.modules, save_dir, batch_quant=qbatch)
-
-    def configure_optimizers(self):
-        """Configures and defines the optimizer for the task. Defaults to adam
-        with lr=0.001; It can be overwritten by either passing arguments from the
-        command line, or by overwriting this entire method.
-        Scheduler step is called every optimization step.
-
-        Returns
-        -------
-        Optimizer and learning rate scheduler.
-            : Union[Tuple[torch.optim.Adam, None], torch.optim.Adam]
-
-        """
-        assert self.hparams.opt in [
-            "adam",
-            "sgd",
-        ], f"Optimizer {self.hparams.opt} not supported."
-        if self.hparams.opt == "adam":
-            opt = torch.optim.Adam(self.modules.parameters(), self.hparams.lr)
-        elif self.hparams.opt == "sgd":
-            opt = torch.optim.SGD(self.modules.parameters(), self.hparams.lr)
-
-        return opt
-
-    def __call__(self, *x, **xv):
-        """Just forwards everything to the forward method."""
-        return self.forward(*x, **xv)
-
-    def add_forward_to_modules(self):
-        """Exports MicroMind forward function to its core ModuleList."""
-        bound_method = self.forward.__get__(self.modules, self.modules.__class__)
-        setattr(self.modules, "forward", bound_method)
-        self.modules.device = self.device
+            if qbatch is not None:
+                qbatch = qbatch.permute(0, 3, 2, 1)
+            convert.convert_to_tflite(self, save_dir, batch_quant=qbatch)
+        else:
+            raise ValueError(f"Unsupported format: {out_format}")
+        
+        logger.info(f"Model exported to {save_dir} in {out_format} format")
 
     @torch.no_grad()
-    def compute_params(self):
-        """Computes the number of parameters for the modules inside `self.modules`.
-        Returns a dictionary with the parameter count for each module.
-
+    def compute_params(self, log= True) -> Dict[str, int]:
+        """
+        Compute number of parameters for each module.
+        
         Returns
         -------
-        Parameter count for self.modules. : Dict[int]
+            params : Dict[str, int]
+                Parameter count for each module and total
         """
+        was_training = self.training
         self.eval()
         params = {}
-        for k, m in self.modules.items():
+        
+        for k, m in self.modules_dict.items():
             params[k] = summary(m, verbose=0).total_params
+        
+        params['total'] = sum(p.numel() for p in self.parameters())
+        
+        self.train(was_training)
+        if log:
+            for k, v in params.items():
+                logger.info(f"Parameters in {k}: {v}")
+            logger.info(f"Total parameters: {params['total']}")
 
         return params
-
+    
     @torch.no_grad()
-    def compute_macs(self, input_shape: Union[List, Tuple]):
-        """Computes the number of multiply-add for the modules inside `self.modules`.
-        Returns a dictionary with the MAC count for each module.
-
+    def compute_macs(self, input_shape: Optional[Union[List, Tuple]], log=True) -> Optional[Dict[str, int]]:
+        """
+        Computes the number of multiply-accumulate operations.
+        
         Arguments
         ---------
-        input_shape : Union[List, Tuple]
-            Needed for MAC computation.
-
+            input_shape : Union[List, Tuple]
+                Input shape for MAC computation.
+                
         Returns
         -------
-        MAC count for self.modules. : Dict[int]
+            macs : Dict[str, int]
+                MAC count for each module.
         """
+        was_training = self.training
         self.eval()
-
+        
         try:
             macs = {}
             last_in = torch.zeros([1] + list(input_shape))
-            for k, m in self.modules.items():
+            
+            for k, m in self.modules_dict.items():
                 macs[k] = summary(m, input_data=last_in, verbose=0).total_mult_adds
                 last_in = m(last_in)
-        except RuntimeError:
-            tmp = """
-            Could not compute the number of MACs of your MicroMind. Might be due
-            to on-the-fly data augmentation or something similar. You can, however,
-            estimate this more accurately after exporting the model.
-            """
-            warnings.warn(" ".join(tmp.split()))
+                
+        except RuntimeError as e:
+            warnings.warn(
+                f"Could not compute MACs: {e}. This might be due to "
+                "dynamic operations. You can estimate this after exporting."
+            )
             macs = None
 
+        self.train(was_training)
+
+        if log and macs is not None:
+            for k, v in macs.items():
+                logger.info(f"MACs in {k}: {v}")
+                
         return macs
-
-    def on_train_start(self):
-        """Initializes the optimizer, modules and puts the networks on the right
-        devices. Optionally loads checkpoint if already present.
-
-        This function gets executed at the beginning of every training.
-        """
-
-        # pass debug status to checkpointer
-        self.checkpointer.debug = self.hparams.debug
-
-        init_opt = self.configure_optimizers()
-        if isinstance(init_opt, list) or isinstance(init_opt, tuple):
-            self.opt, self.lr_sched = init_opt
-        else:
-            self.opt = init_opt
-
-        self.init_devices()
-
-        self.start_epoch = 0
-        if self.checkpointer is not None:
-            # recover state
-            ckpt = self.checkpointer.recover_state()
-            if ckpt is not None:
-                accelerate_path, self.start_epoch = ckpt
-                self.accelerator.load_state(accelerate_path)
-        else:
-            tmp = """
-                You are not passing a checkpointer to the training function, \
-                thus no status will be saved. If this is not the intended behaviour \
-                please check https://micromind-toolkit.github.io/docs/").
-            """
-            warnings.warn(" ".join(tmp.split()))
-
-    def init_devices(self):
-        """Initializes the data pipeline and modules for DDP and accelerated inference.
-        To control the device selection, use `accelerate config`."""
-
-        # pass each module through DDP independently
-        convert = list(self.modules.values())
-        if hasattr(self, "opt"):
-            convert += [self.opt]
-
-        if hasattr(self, "lr_sched"):
-            convert += [self.lr_sched]
-
-        if hasattr(self, "datasets"):
-            # if the datasets are store here, prepare them for DDP
-            convert += list(self.datasets.values())
-
-        accelerated = self.accelerator.prepare(*convert)
-        for idx, key in enumerate(self.modules):
-            self.modules[key] = accelerated[idx]
-        self.accelerator.register_for_checkpointing(self.modules)
-
-        if hasattr(self, "opt"):
-            self.opt = accelerated[len(self.modules)]
-            self.accelerator.register_for_checkpointing(self.opt)
-
-        if hasattr(self, "lr_sched"):
-            self.lr_sched = accelerated[1 + len(self.modules)]
-            self.accelerator.register_for_checkpointing(self.lr_sched)
-
-        if hasattr(self, "datasets"):
-            for i, key in enumerate(list(self.datasets.keys())[::-1]):
-                self.datasets[key] = accelerated[-(i + 1)]
-
-        self.modules.to(self.device)
-
-    def on_train_end(self):
-        """Runs at the end of each training. Cleans up before exiting."""
-        pass
-
-    def eval(self):
-        self.modules.eval()
-
-    def train(
-        self,
-        epochs: int = 1,
-        datasets: Dict = {},
-        metrics: List[Metric] = [],
-        checkpointer: Optional[Checkpointer] = None,
-        debug: Optional[bool] = False,
-    ) -> None:
-        """
-        This method trains the model on the provided training dataset for the
-        specified number of epochs. It tracks training metrics and can
-        optionally perform validation during training, if the validation set is
-        provided.
-
-        Arguments
-        ---------
-        epochs : int
-            The number of training epochs.
-        datasets : Dict
-            A dictionary of dataset loaders. Dataloader should be mapped to keys
-            "train", "val", and "test".
-        metrics : Optional[List[Metric]]
-            A list of metrics to track during training. Default is an empty list.
-        checkpointer : Optional[mm.utils.Checkpointer]
-            Checkpointer used to log the experiments and save best checkpoints
-            during training.
-        debug : bool
-            Whether to run in debug mode. Default is False. If in debug mode,
-            only runs for few epochs
-            and with few batches.
-        """
-        self.datasets = datasets
-        self.metrics = metrics
-        self.checkpointer = checkpointer
-        assert "train" in self.datasets, "Training dataloader was not specified."
-        assert epochs > 0, "You must specify at least one epoch."
-
-        self.debug = debug
-
-        self.on_train_start()
-
-        if self.accelerator.is_local_main_process:
-            logger.info(
-                f"Starting from epoch {self.start_epoch + 1}."
-                + f" Training is scheduled for {epochs} epochs."
-            )
-
-        for e in range(self.start_epoch + 1, epochs + 1):
-            self.current_epoch = e
-            pbar = tqdm(
-                self.datasets["train"],
-                unit="batches",
-                ascii=True,
-                dynamic_ncols=True,
-                disable=not self.accelerator.is_local_main_process,
-            )
-            loss_epoch = 0
-            pbar.set_description(f"Running epoch {self.current_epoch}/{epochs}")
-            self.modules.train()
-            for idx, batch in enumerate(pbar):
-                if isinstance(batch, list):
-                    batch = [b.to(self.device) for b in batch]
-
-                self.opt.zero_grad()
-
-                with self.accelerator.autocast():
-                    model_out = self(batch)
-                    loss = self.compute_loss(model_out, batch)
-                    loss_epoch += loss.item()
-
-                self.accelerator.backward(loss)
-                self.opt.step()
-
-                if hasattr(self, "lr_sched"):
-                    # ok for cos_lr
-                    self.lr_sched.step()
-
-                for m in self.metrics:
-                    if (
-                        self.current_epoch + 1
-                    ) % m.eval_period == 0 and not m.eval_only:
-                        m(model_out, batch, Stage.train, self.device)
-
-                running_train = {}
-                for m in self.metrics:
-                    if (
-                        self.current_epoch + 1
-                    ) % m.eval_period == 0 and not m.eval_only:
-                        running_train["train_" + m.name] = m.reduce(Stage.train)
-
-                running_train.update({"train_loss": loss_epoch / (idx + 1)})
-
-                pbar.set_postfix(**running_train)
-
-                if self.debug and idx > 10:
-                    break
-
-            pbar.close()
-
-            train_metrics = {}
-            for m in self.metrics:
-                if (self.current_epoch + 1) % m.eval_period == 0 and not m.eval_only:
-                    train_metrics["train_" + m.name] = m.reduce(Stage.train, True)
-
-            train_metrics.update({"train_loss": loss_epoch / (idx + 1)})
-
-            if "val" in datasets:
-                val_metrics = self.validate()
-                if (
-                    self.accelerator.is_local_main_process
-                    and self.checkpointer is not None
-                ):
-                    self.checkpointer(
-                        self,
-                        train_metrics,
-                        val_metrics,
-                    )
-            else:
-                val_metrics = train_metrics.update({"val_loss": loss_epoch / (idx + 1)})
-
-            if e >= 1 and self.debug:
-                break
-
-        self.on_train_end()
-        return None
-
-    @torch.no_grad()
-    def validate(self) -> Dict:
-        """Runs the validation step."""
-        assert "val" in self.datasets, "Validation dataloader was not specified."
-        self.modules.eval()
-
-        pbar = tqdm(
-            self.datasets["val"],
-            unit="batches",
-            ascii=True,
-            dynamic_ncols=True,
-            disable=not self.accelerator.is_local_main_process,
-        )
-        loss_epoch = 0
-        pbar.set_description("Validation...")
-        with self.accelerator.autocast():
-            for idx, batch in enumerate(pbar):
-                if isinstance(batch, list):
-                    batch = [b.to(self.device) for b in batch]
-
-                self.opt.zero_grad()
-
-                model_out = self(batch)
-                loss = self.compute_loss(model_out, batch)
-                for m in self.metrics:
-                    if (self.current_epoch + 1) % m.eval_period == 0:
-                        m(model_out, batch, Stage.val, self.device)
-
-                loss_epoch += loss.item()
-                pbar.set_postfix(loss=loss_epoch / (idx + 1))
-
-                if self.debug and idx > 10:
-                    break
-
-        val_metrics = {}
-        for m in self.metrics:
-            if (self.current_epoch + 1) % m.eval_period == 0:
-                val_metrics["val_" + m.name] = m.reduce(Stage.val, True)
-
-        val_metrics.update({"val_loss": loss_epoch / (idx + 1)})
-
-        pbar.close()
-
-        return val_metrics
-
-    @torch.no_grad()
-    def test(self, datasets: Dict = {}, metrics: List[Metric] = []) -> None:
-        """Runs the test steps.
-
-        Arguments
-        ---------
-        datasets : Dict
-            Dictionary with the test DataLoader. Should be present in the key
-            `test`.
-        metrics : List[Metric]
-            List of metrics to compute during test step.
-
-        Returns
-        -------
-        Metrics computed on test set. : Dict[torch.Tensor]
-        """
-        assert "test" in datasets, "Test dataloader was not specified."
-        self.modules.eval()
-
-        pbar = tqdm(
-            datasets["test"],
-            unit="batches",
-            ascii=True,
-            dynamic_ncols=True,
-            disable=not self.accelerator.is_local_main_process,
-        )
-        loss_epoch = 0
-        pbar.set_description("Testing...")
-        with self.accelerator.autocast():
-            for idx, batch in enumerate(pbar):
-                if isinstance(batch, list):
-                    batch = [b.to(self.device) for b in batch]
-
-                model_out = self(batch)
-                loss = self.compute_loss(model_out, batch)
-                for m in metrics:
-                    m(model_out, batch, Stage.test, self.device)
-
-                loss_epoch += loss.item()
-                pbar.set_postfix(loss=loss_epoch / (idx + 1))
-
-        pbar.close()
-
-        test_metrics = {"test_" + m.name: m.reduce(Stage.test, True) for m in metrics}
-        test_metrics.update({"test_loss": loss_epoch / (idx + 1)})
-        s_out = (
-            "Testing "
-            + " - ".join([f"{k}: {v:.2f}" for k, v in test_metrics.items()])
-            + "; "
-        )
-
-        logger.info(s_out)
-
-        return test_metrics

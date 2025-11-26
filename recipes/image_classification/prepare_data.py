@@ -8,6 +8,8 @@ Authors:
 
 """
 import torch
+from torch.utils.data import DataLoader
+from pytorch_lightning import LightningDataModule
 
 from timm.data import (
     AugMixDataset,
@@ -19,19 +21,11 @@ from argparse import Namespace
 
 
 def setup_mixup(args: Namespace):
-    """Setup of Mixup data augmentation based on input configuration.
-
-    Arguments
-    ---------
-    args : Namespace
-        Input configuration for the experiment.
-
-    Returns
-    -------
-    Mixup function and respective collate_fn. : Union[Callable, Callable]"""
+    """Setup Mixup data augmentation."""
     collate_fn = None
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0.0 or args.cutmix_minmax is not None
+
     if mixup_active:
         mixup_args = dict(
             mixup_alpha=args.mixup,
@@ -48,122 +42,134 @@ def setup_mixup(args: Namespace):
     return mixup_fn, collate_fn
 
 
-def create_loaders(args: Namespace):
-    """Creates DataLoaders for dataset specified in the configuration file.
-    Refer to ... for how to select the proper configuration.
-
-    Arguments
-    ---------
-    args : Namespace
-        Input configuration for the experiment.
+class ImageDataModule(LightningDataModule):
     """
-    # args.prefetcher = not args.no_prefetcher
-    args.prefetcher = False
-    args.distributed = False
+    LightningDataModule version timm dataloader pipeline.
+    """
 
-    num_aug_splits = 0
-    if args.aug_splits > 0:
-        assert args.aug_splits > 1, "A split of 1 makes no sense"
-        num_aug_splits = args.aug_splits
+    def __init__(self, args: Namespace):
+        super().__init__()
+        self.args = args
+        self.dataset_train = None
+        self.dataset_eval = None
+        self.mixup_fn = None
+        self.collate_fn = None
 
-    # create the train and eval datasets
-    dataset_train = create_dataset(
-        args.dataset,
-        root=args.data_dir,
-        split=args.train_split,
-        is_training=True,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size,
-        repeats=args.epoch_repeats,
-    )
-    dataset_eval = create_dataset(
-        args.dataset,
-        root=args.data_dir,
-        split=args.val_split,
-        is_training=False,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size,
-    )
+        # force-disable options
+        self.args.prefetcher = False
+        self.args.distributed = False
 
-    mixup_fn, collate_fn = setup_mixup(args)
+        # aug splits
+        if args.aug_splits > 1:
+            self.num_aug_splits = args.aug_splits
+        else:
+            self.num_aug_splits = 0
 
-    # wrap dataset in AugMix helper
-    if num_aug_splits > 1:
-        dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
+    def setup(self, stage=None):
+        """Create datasets and transforms."""
+        args = self.args
 
-    # create data loaders w/ augmentation pipeiine
-    train_interpolation = args.train_interpolation
-    if args.no_aug or not train_interpolation:
-        train_interpolation = args.interpolation
-    re_num_splits = 0
-    dataset_train.transform = create_transform(
-        input_size=args.input_shape,
-        is_training=True,
-        use_prefetcher=args.prefetcher,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        auto_augment=args.aa,
-        interpolation=train_interpolation,
-        mean=args.mean,
-        std=args.std,
-        tf_preprocessing=False,
-        re_num_splits=re_num_splits,
-        separate=num_aug_splits > 0,
-    )
+        # datasets
+        self.dataset_train = create_dataset(
+            args.dataset,
+            root=args.data_dir,
+            split=args.train_split,
+            is_training=True,
+            class_map=args.class_map,
+            download=args.dataset_download,
+            batch_size=args.batch_size,
+            repeats=args.epoch_repeats,
+        )
+        self.dataset_eval = create_dataset(
+            args.dataset,
+            root=args.data_dir,
+            split=args.val_split,
+            is_training=False,
+            class_map=args.class_map,
+            download=args.dataset_download,
+            batch_size=args.batch_size,
+        )
 
-    dataset_eval.transform = create_transform(
-        input_size=args.input_shape,
-        is_training=False,
-        use_prefetcher=args.prefetcher,
-        no_aug=args.no_aug,
-        re_prob=args.reprob,
-        re_mode=args.remode,
-        re_count=args.recount,
-        scale=args.scale,
-        ratio=args.ratio,
-        hflip=args.hflip,
-        vflip=args.vflip,
-        color_jitter=args.color_jitter,
-        auto_augment=args.aa,
-        interpolation=train_interpolation,
-        mean=args.mean,
-        std=args.std,
-        tf_preprocessing=False,
-        re_num_splits=re_num_splits,
-        separate=num_aug_splits > 0,
-    )
+        # mixup
+        self.mixup_fn, self.collate_fn = setup_mixup(args)
 
-    if collate_fn is None:
-        collate_fn = torch.utils.data.dataloader.default_collate
+        # wrap dataset in AugMix helper
+        if self.num_aug_splits > 1:
+            self.dataset_train = AugMixDataset(self.dataset_train, num_splits=self.num_aug_splits)
 
-    loader_class = torch.utils.data.DataLoader
+        # transforms
+        train_interp = args.train_interpolation or args.interpolation
+        re_splits = 0
 
-    loader_args = dict(
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=args.pin_memory,
-        drop_last=True,
-        persistent_workers=args.persistent_workers,
-    )
-    try:
-        loader_train = loader_class(dataset_train, **loader_args)
-        loader_args["drop_last"] = False
-        loader_eval = loader_class(dataset_eval, **loader_args)
-    except TypeError:
-        loader_args.pop("persistent_workers")  # only in Pytorch 1.7+
-        loader_train = loader_class(dataset_train, **loader_args)
-        loader_args["drop_last"] = False
-        loader_eval = loader_class(dataset_eval, **loader_args)
+        self.dataset_train.transform = create_transform(
+            input_size=args.input_shape,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            interpolation=train_interp,
+            mean=args.mean,
+            std=args.std,
+            tf_preprocessing=False,
+            re_num_splits=re_splits,
+            separate=self.num_aug_splits > 0,
+        )
 
-    return loader_train, loader_eval
+        self.dataset_eval.transform = create_transform(
+            input_size=args.input_shape,
+            is_training=False,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            interpolation=train_interp,
+            mean=args.mean,
+            std=args.std,
+            tf_preprocessing=False,
+            re_num_splits=re_splits,
+            separate=self.num_aug_splits > 0,
+        )
+
+        # default collate
+        if self.collate_fn is None:
+            self.collate_fn = torch.utils.data.dataloader.default_collate
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.dataset_train,
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            collate_fn=self.collate_fn,
+            pin_memory=self.args.pin_memory,
+            drop_last=True,
+            persistent_workers=self.args.persistent_workers,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.dataset_eval,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+            collate_fn=self.collate_fn,
+            pin_memory=self.args.pin_memory,
+            drop_last=False,
+            persistent_workers=self.args.persistent_workers,
+        )
+
