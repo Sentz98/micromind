@@ -74,10 +74,18 @@ class MicroMind(pl.LightningModule):
         self.train_metrics = MetricCollection({}, prefix='train_')
         self.val_metrics = MetricCollection({}, prefix='val_')
         self.test_metrics = MetricCollection({}, prefix='test_')
+
+        # Cache for extraction functions per stage
+        self._extraction_fn_cache = {
+            'train': None,
+            'val': None,
+            'test': None,
+        }
         
-        # TODO CHECK Flag to control automatic metric computation
+        # TODO decide what to do with this flag
         # Set to False if you want to handle metrics manually in your subclass
         self._auto_compute_metrics = True
+
 
     @abstractmethod
     def forward(self, batch):
@@ -154,8 +162,15 @@ class MicroMind(pl.LightningModule):
         if len(metric_collection) == 0:
             return None
         
-        # Try to extract predictions and targets intelligently
-        preds, targets = self._extract_preds_targets(pred, batch)
+        # Use cached extraction function if available
+        if self._extraction_fn_cache[stage] is not None:
+            preds, targets = self._extraction_fn_cache[stage](pred, batch)
+        else:
+            # First time for this stage - detect format and cache
+            preds, targets, extraction_fn = self._detect_and_cache_extraction(
+                pred, batch, stage
+            )
+            self._extraction_fn_cache[stage] = extraction_fn
         
         if preds is None or targets is None:
             # Cannot extract predictions/targets automatically
@@ -167,56 +182,116 @@ class MicroMind(pl.LightningModule):
         
         return metrics
     
-    def _extract_preds_targets(
+    def _detect_and_cache_extraction(
         self, 
         pred, 
-        batch
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        batch, 
+        stage: str
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[Callable]]:
         """
-        Extract predictions and targets from various common formats.
+        Detect format once and return both values and extraction function.
         
-        This is a helper method that handles common data structures.
-        Override this method if you have a custom format that doesn't fit
-        these patterns.
+        This method analyzes the first batch to determine the data format,
+        then creates an optimized extraction function for future batches.
+
+        TODO if the format changes mid-training this logic will fail since 
+        relies on first batch detection. careful with dict
         
-        Arguments
-        ---------
-            pred : Any
-                Predictions from forward()
-            batch : Any
-                Input batch
-                
         Returns
         -------
             preds : Optional[torch.Tensor]
-                Extracted predictions, or None if extraction failed
+                Extracted predictions for this batch
             targets : Optional[torch.Tensor]
-                Extracted targets, or None if extraction failed
+                Extracted targets for this batch
+            extraction_fn : Optional[Callable]
+                Optimized function for future extractions
         """
-        preds = None
-        targets = None
-        
-        # Case 1: pred is a tuple/list with (predictions, targets)
+        # Tuple/List format 
         if isinstance(pred, (tuple, list)) and len(pred) >= 2:
-            preds, targets = pred[0], pred[1]
+            logger.debug(f"[{stage}] Detected tuple/list format for metrics")
+            
+            def extract_tuple(p, b):
+                return p[0], p[1]
+            
+            return pred[0], pred[1], extract_tuple
         
-        # Case 2: pred is a dict with prediction/target keys
+        # Dict format 
         elif isinstance(pred, dict):
-            # Try common key names for predictions
-            preds = pred.get('preds') or pred.get('predictions') or pred.get('logits') or pred.get('output')
-            # Try common key names for targets
-            targets = pred.get('targets') or pred.get('labels') or pred.get('target') or pred.get('label')
+            pred_key = None
+            target_key = None
+            
+            # Check for prediction keys (in order of preference)
+            for key in ['preds', 'predictions', 'logits', 'output']:
+                if key in pred and pred[key] is not None:
+                    pred_key = key
+                    break
+            
+            # Check for target keys (in order of preference)
+            for key in ['targets', 'labels', 'target', 'label']:
+                if key in pred and pred[key] is not None:
+                    target_key = key
+                    break
+            
+            if pred_key and target_key:
+                logger.debug(
+                    f"[{stage}] Detected dict format: "
+                    f"preds='{pred_key}', targets='{target_key}'"
+                )
+                
+                # Create closure with detected keys
+                # Using closure to capture pred_key and target_key
+                def make_dict_extractor(pk, tk):
+                    def extract_dict(p, b):
+                        return p.get(pk), p.get(tk)
+                    return extract_dict
+                
+                extraction_fn = make_dict_extractor(pred_key, target_key)
+                return pred[pred_key], pred[target_key], extraction_fn
         
-        # Case 3: pred is just predictions, targets in batch
+        # Tensor prediction, targets in batch
         elif torch.is_tensor(pred):
-            preds = pred
+            targets = None
+            target_source = None
+            target_key = None
+            
             # Try to extract targets from batch
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 targets = batch[1]
+                target_source = 'batch_tuple'
             elif isinstance(batch, dict):
-                targets = batch.get('targets') or batch.get('labels') or batch.get('target') or batch.get('label')
+                for key in ['targets', 'labels', 'target', 'label']:
+                    if key in batch and batch[key] is not None:
+                        targets = batch[key]
+                        target_source = 'batch_dict'
+                        target_key = key
+                        break
+            
+            if targets is not None:
+                logger.debug(
+                    f"[{stage}] Detected tensor format, "
+                    f"targets from {target_source}"
+                )
+                
+                if target_source == 'batch_tuple':
+                    def extract_tensor_tuple(p, b):
+                        return p, b[1]
+                    return pred, targets, extract_tensor_tuple
+                else:  # batch_dict
+                    def make_tensor_dict_extractor(tk):
+                        def extract_tensor_dict(p, b):
+                            return p, b.get(tk)
+                        return extract_tensor_dict
+                    
+                    extraction_fn = make_tensor_dict_extractor(target_key)
+                    return pred, targets, extraction_fn
         
-        return preds, targets
+        # Failed to detect format
+        logger.warning(
+            f"[{stage}] Could not auto-detect prediction/target format. "
+            f"Override compute_metrics() in your subclass."
+        )
+        return None, None, None
+   
 
     def add_metric(
         self,
@@ -285,7 +360,6 @@ class MicroMind(pl.LightningModule):
         self.log('train_loss', loss, on_step=True, on_epoch=True, 
                  prog_bar=True, sync_dist=True)
         
-        # Compute metrics if implemented
         if self._auto_compute_metrics:
             metrics = self.compute_metrics(pred, batch, stage='train')
             if metrics is not None:
@@ -307,7 +381,6 @@ class MicroMind(pl.LightningModule):
         self.log('val_loss', loss, on_step=False, on_epoch=True, 
                  prog_bar=True, sync_dist=True)
         
-        # Compute metrics if implemented
         if self._auto_compute_metrics:
             metrics = self.compute_metrics(pred, batch, stage='val')
             if metrics is not None:
@@ -327,7 +400,6 @@ class MicroMind(pl.LightningModule):
         
         self.log('test_loss', loss, on_epoch=True, sync_dist=True)
         
-        # Compute metrics if implemented
         if self._auto_compute_metrics:
             metrics = self.compute_metrics(pred, batch, stage='test')
             if metrics is not None:
@@ -341,6 +413,7 @@ class MicroMind(pl.LightningModule):
         
         Override this method to customize optimization. By default uses Adam
         with learning rate from hparams.
+        TODO this function needs to be extended or removed
         
         Returns
         -------
