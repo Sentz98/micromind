@@ -68,6 +68,8 @@ class MicroMind(pl.LightningModule):
         
         # Use 'modules_dict' to avoid conflict with nn.Module.modules()
         self.modules_dict = torch.nn.ModuleDict({})
+
+        # Input shape for export and MAC computation
         self.input_shape = None
         
         # Initialize metric collections for each stage
@@ -85,6 +87,13 @@ class MicroMind(pl.LightningModule):
         # TODO decide what to do with this flag
         # Set to False if you want to handle metrics manually in your subclass
         self._auto_compute_metrics = True
+
+        #----------RESOURCES
+        self.target_resources = {
+            "WM" : None,
+            "FLASH" : None,
+            "MACCs" : None, # The amount of desired macc (1 to 10 Macc)[0, 1] * 9 + 1 
+        }
 
 
     @abstractmethod
@@ -114,6 +123,20 @@ class MicroMind(pl.LightningModule):
         
         This method MUST be implemented.
         It gives you complete control over how loss is computed for your task.
+        IMPLEMENTATION CHECKLIST:
+        ✓ Return a scalar torch.Tensor 
+        ✓ Ensure the tensor requires gradients
+        ✓ Handle NaN/Inf cases gracefully
+        
+        Common mistakes:
+        ✗ Returning Python float: return float(loss)  # Wrong!
+        ✗ Returning non-scalar: return losses  # Wrong! Use losses.mean()
+        ✗ Detaching loss: return loss.detach()  # Wrong! Prevents gradients
+        
+        Correct example:
+            criterion = nn.CrossEntropyLoss()
+            loss = criterion(pred, targets)
+            return loss  # Already a scalar tensor with gradients
 
         Arguments
         ---------
@@ -128,6 +151,93 @@ class MicroMind(pl.LightningModule):
                 Computed loss value (scalar tensor).
         """
         pass
+
+    def _validated_compute_loss(self, pred, batch) -> torch.Tensor:
+        """
+        Internal wrapper that validates compute_loss() output.
+        """
+        loss = self.compute_loss(pred, batch)
+        
+        # Validation checks
+        if not isinstance(loss, torch.Tensor):
+            raise TypeError(
+                f"compute_loss() must return a torch.Tensor, got {type(loss)}. "
+                f"Make sure your loss function returns a tensor."
+            )
+        
+        if loss.dim() != 0:
+            raise ValueError(
+                f"compute_loss() must return a scalar (0-dim tensor), got shape {loss.shape}. "
+                f"Use .mean(), .sum(), or similar to reduce your loss to a scalar."
+            )
+        
+        if not loss.requires_grad:
+            warnings.warn(
+                "Loss tensor doesn't require gradients. This will prevent training. "
+                "Make sure your loss is computed from model parameters.",
+                UserWarning
+            )
+        
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise ValueError(
+                f"compute_loss() returned {loss.item()}. "
+                f"Check for numerical instability in your loss computation."
+            )
+        
+        return loss
+    
+    def add_metric(
+        self,
+        name: str,
+        metric: Union[TorchMetric, Callable],
+        stage: str = 'all'
+    ):
+        """
+        Add a metric for tracking during training/validation/testing.
+        
+        Supports both TorchMetrics instances and custom functions. Custom functions
+        are automatically wrapped in CustomMetric for proper state management.
+        
+        Arguments
+        ---------
+            name : str
+                Name of the metric (will be prefixed with stage name, e.g., 'val_acc')
+            metric : Union[TorchMetric, Callable]
+                Either:
+                - A TorchMetric instance (recommended)
+                - A callable function(preds, targets) -> scalar (for custom metrics)
+            stage : str
+                Which stage to track metric: 'train', 'val', 'test', or 'all'
+                Default: 'all'
+        
+        """
+        # Wrap callable functions in CustomMetric
+        if callable(metric) and not isinstance(metric, TorchMetric):
+            logger.info(
+                f"Wrapping custom function '{name}' in CustomMetric. "
+                f"Consider using TorchMetrics for better performance."
+            )
+            metric = CustomMetric(metric)
+        
+        # Validate it's now a TorchMetric
+        if not isinstance(metric, TorchMetric):
+            raise TypeError(
+                f"Metric must be a TorchMetric or callable, got {type(metric)}"
+            )
+        
+        # Add to appropriate stages
+        stages = ['train', 'val', 'test'] if stage == 'all' else [stage]
+        
+        for s in stages:
+            if s not in ['train', 'val', 'test']:
+                raise ValueError(f"Invalid stage '{s}'. Must be 'train', 'val', 'test', or 'all'")
+            
+            metric_collection = getattr(self, f'{s}_metrics')
+            
+            # Clone metric to avoid sharing state between stages
+            metric_collection.add_metrics({name: metric.clone()})
+            
+            logger.debug(f"Added metric '{name}' to {s} stage")
 
     def compute_metrics(self, pred, batch, stage: str) -> Optional[Dict[str, torch.Tensor]]:
         """
@@ -292,60 +402,6 @@ class MicroMind(pl.LightningModule):
         )
         return None, None, None
    
-
-    def add_metric(
-        self,
-        name: str,
-        metric: Union[TorchMetric, Callable],
-        stage: str = 'all'
-    ):
-        """
-        Add a metric for tracking during training/validation/testing.
-        
-        Supports both TorchMetrics instances and custom functions. Custom functions
-        are automatically wrapped in CustomMetric for proper state management.
-        
-        Arguments
-        ---------
-            name : str
-                Name of the metric (will be prefixed with stage name, e.g., 'val_acc')
-            metric : Union[TorchMetric, Callable]
-                Either:
-                - A TorchMetric instance (recommended)
-                - A callable function(preds, targets) -> scalar (for custom metrics)
-            stage : str
-                Which stage to track metric: 'train', 'val', 'test', or 'all'
-                Default: 'all'
-        
-        """
-        # Wrap callable functions in CustomMetric
-        if callable(metric) and not isinstance(metric, TorchMetric):
-            logger.info(
-                f"Wrapping custom function '{name}' in CustomMetric. "
-                f"Consider using TorchMetrics for better performance."
-            )
-            metric = CustomMetric(metric)
-        
-        # Validate it's now a TorchMetric
-        if not isinstance(metric, TorchMetric):
-            raise TypeError(
-                f"Metric must be a TorchMetric or callable, got {type(metric)}"
-            )
-        
-        # Add to appropriate stages
-        stages = ['train', 'val', 'test'] if stage == 'all' else [stage]
-        
-        for s in stages:
-            if s not in ['train', 'val', 'test']:
-                raise ValueError(f"Invalid stage '{s}'. Must be 'train', 'val', 'test', or 'all'")
-            
-            metric_collection = getattr(self, f'{s}_metrics')
-            
-            # Clone metric to avoid sharing state between stages
-            metric_collection.add_metrics({name: metric.clone()})
-            
-            logger.debug(f"Added metric '{name}' to {s} stage")
-
     def training_step(self, batch, batch_idx):
         """
         Lightning training step - called for each training batch.
@@ -354,7 +410,7 @@ class MicroMind(pl.LightningModule):
         of forward(), compute_loss(), and compute_metrics().
         """
         pred = self(batch)
-        loss = self.compute_loss(pred, batch)
+        loss = self._validated_compute_loss(pred, batch)
         
         # Log loss
         self.log('train_loss', loss, on_step=True, on_epoch=True, 
@@ -375,7 +431,7 @@ class MicroMind(pl.LightningModule):
         of forward(), compute_loss(), and compute_metrics().
         """
         pred = self(batch)
-        loss = self.compute_loss(pred, batch)
+        loss = self._validated_compute_loss(pred, batch)
         
         # Log loss
         self.log('val_loss', loss, on_step=False, on_epoch=True, 
@@ -396,7 +452,7 @@ class MicroMind(pl.LightningModule):
         of forward(), compute_loss(), and compute_metrics().
         """
         pred = self(batch)
-        loss = self.compute_loss(pred, batch)
+        loss = self._validated_compute_loss(pred, batch)
         
         self.log('test_loss', loss, on_epoch=True, sync_dist=True)
         
@@ -443,30 +499,99 @@ class MicroMind(pl.LightningModule):
         """
         self.input_shape = input_shape
 
-    def load_modules(self, checkpoint_path: Union[Path, str]):
+    def load_checkpoint(
+        self, 
+        checkpoint_path: Union[Path, str], 
+        module_key: Optional[str] = None,
+        strip_prefix: Optional[str] = None,
+        strict: bool = True,
+        map_location: str = "cpu"
+    ):
         """
-        Load model from checkpoint (compatible with original API).
-        
+        Flexible checkpoint loader. Can load full Lightning checkpoints, generic PyTorch 
+        state_dicts, or specific sub-modules with key remapping.
+
         Arguments
         ---------
             checkpoint_path : Union[Path, str]
                 Path to the checkpoint file.
+            module_key : Optional[str]
+                If provided, loads the checkpoint ONLY into self.modules_dict[module_key].
+                If None, tries to load into the top-level LightningModule.
+            strip_prefix : Optional[str]
+                If provided, strips this prefix from checkpoint keys before loading.
+                Useful when loading a sub-module that was saved as part of a larger model.
+            strict : bool
+                Whether to strictly enforce that the keys in state_dict match the keys 
+                returned by module's state_dict(). Default: True.
+            map_location : str
+                Device mapping for loading. Default: "cpu".
         """
-        # TODO check support both Lightning and original micromind checkpoint formats
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+
         try:
-            # Try Lightning format first
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            if 'state_dict' in checkpoint:
-                self.load_state_dict(checkpoint['state_dict'])
+            # Load the file
+            loaded_obj = torch.load(checkpoint_path, map_location=map_location)
+            
+            # 1. Unwrap Lightning Checkpoints or nested dictionaries
+            if isinstance(loaded_obj, dict) and 'state_dict' in loaded_obj:
+                state_dict = loaded_obj['state_dict']
+            elif isinstance(loaded_obj, dict):
+                state_dict = loaded_obj
             else:
-                # Original format - load modules_dict modules
-                for k in self.modules_dict:
-                    if k in checkpoint:
-                        self.modules_dict[k].load_state_dict(checkpoint[k])
+                # Handle cases where the checkpoint is just the model object (rare but possible)
+                state_dict = loaded_obj.state_dict() if hasattr(loaded_obj, "state_dict") else loaded_obj
+
+            # 2. Target a specific module in modules_dict
+            if module_key is not None:
+                if module_key not in self.modules_dict:
+                    raise KeyError(f"Module '{module_key}' not found in modules_dict.")
+                
+                target_model = self.modules_dict[module_key]
+                logger.info(f"Loading weights into specific module: '{module_key}'")
+            else:
+                target_model = self
+                logger.info("Loading weights into full MicroMind model")
+
+            # 3. Handle Prefix Stripping / Key Remapping
+            # If we are loading into a specific module, we might need to fix keys.
+            final_state_dict = {}
+            
+            for k, v in state_dict.items():
+                new_key = k
+                
+                # Remove specific prefix if requested (e.g. "backbone.")
+                if strip_prefix and new_key.startswith(strip_prefix):
+                    new_key = new_key[len(strip_prefix):]
+                
+                # If loading into a submodule, we often need to remove the wrapper prefix
+                # Example: Checkpoint has "modules_dict.backbone.layer1..."
+                #          Target (backbone) expects "layer1..."
+                if module_key:
+                    # Heuristic: if the key starts with the module name or typical wrappers, strip them
+                    # Check if key starts with "modules_dict.{module_key}."
+                    wrapper_prefix = f"modules_dict.{module_key}."
+                    if new_key.startswith(wrapper_prefix):
+                        new_key = new_key[len(wrapper_prefix):]
+                
+                final_state_dict[new_key] = v
+
+            # 4. Load State Dict
+            missing, unexpected = target_model.load_state_dict(final_state_dict, strict=strict)
+            
+            # Logging results
+            if len(missing) > 0:
+                logger.warning(f"Missing keys: {missing[:5]}{'...' if len(missing)>5 else ''}")
+            if len(unexpected) > 0:
+                logger.warning(f"Unexpected keys: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
+                
             logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
+
         except Exception as e:
             logger.error(f"Error loading checkpoint: {e}")
-            raise
+            raise e
 
     def export(
         self,
@@ -554,6 +679,7 @@ class MicroMind(pl.LightningModule):
     def compute_macs(self, input_shape: Optional[Union[List, Tuple]], log=True) -> Optional[Dict[str, int]]:
         """
         Computes the number of multiply-accumulate operations.
+        #TODO add support for dynamic input shapes, and operations
         
         Arguments
         ---------
