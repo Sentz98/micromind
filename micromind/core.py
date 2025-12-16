@@ -33,6 +33,13 @@ default_cfg = {
     "opt": "adam",
     "lr": 0.001,
     "debug": False,
+    # Checkpointing defaults
+    "enable_checkpointing": True,
+    "checkpoint_monitor": "val_loss",
+    "checkpoint_mode": "min",
+    "save_top_k": 3,
+    "save_last": True,
+    "checkpoint_every_n_epochs": 1,
 }
 
 
@@ -48,6 +55,8 @@ class MicroMind(pl.LightningModule):
     - Modular: Uses modules_dict for flexible network composition
     - Scalable: Built-in multi-GPU, mixed precision, distributed training
     - Extensible: Override only what you need for your specific task
+    - Auto-resumable: Built-in checkpoint management for interrupted training
+    
     Arguments
     ---------
         hparams : Optional[Namespace]
@@ -94,7 +103,10 @@ class MicroMind(pl.LightningModule):
             "FLASH" : None,
             "MACCs" : None, # The amount of desired macc (1 to 10 Macc)[0, 1] * 9 + 1 
         }
-
+        
+        # Checkpoint callback will be stored here when fit() is called
+        self._checkpoint_callback = None
+        self._trainer_configured = False
 
     @abstractmethod
     def forward(self, batch):
@@ -123,6 +135,7 @@ class MicroMind(pl.LightningModule):
         
         This method MUST be implemented.
         It gives you complete control over how loss is computed for your task.
+        
         IMPLEMENTATION CHECKLIST:
         ✓ Return a scalar torch.Tensor 
         ✓ Ensure the tensor requires gradients
@@ -488,6 +501,220 @@ class MicroMind(pl.LightningModule):
         
         return optimizer
     
+    def setup_checkpoint_callback(self) -> ModelCheckpoint:
+        """
+        Setup the checkpoint callback with parameters from hparams.
+        
+        Can be overridden in subclasses for custom checkpointing behavior.
+        
+        Returns
+        -------
+            checkpoint_callback : ModelCheckpoint
+                Configured checkpoint callback
+        """
+        exp_folder = Path(self.hparams.output_folder) / self.hparams.experiment_name
+        exp_folder.mkdir(parents=True, exist_ok=True)
+        
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=exp_folder,
+            filename='{epoch}-{val_loss:.2f}',
+            monitor=getattr(self.hparams, 'checkpoint_monitor', 'val_loss'),
+            mode=getattr(self.hparams, 'checkpoint_mode', 'min'),
+            save_top_k=getattr(self.hparams, 'save_top_k', 3),
+            save_last=getattr(self.hparams, 'save_last', True),
+            every_n_epochs=getattr(self.hparams, 'checkpoint_every_n_epochs', 1),
+            verbose=True,
+        )
+        
+        logger.info(f"Checkpointing configured: {exp_folder}")
+        logger.info(f"  - Monitoring: {checkpoint_callback.monitor} ({checkpoint_callback.mode})")
+        logger.info(f"  - Saving top {checkpoint_callback.save_top_k} + last checkpoint")
+        
+        return checkpoint_callback
+    
+    def setup_logger(self) -> TensorBoardLogger:
+        """
+        Setup the TensorBoard logger with parameters from hparams.
+        
+        Can be overridden in subclasses for custom logging behavior.
+        
+        Returns
+        -------
+            logger : TensorBoardLogger
+                Configured TensorBoard logger
+        """
+        tb_logger = TensorBoardLogger(
+            save_dir=self.hparams.output_folder,
+            name=self.hparams.experiment_name,
+        )
+        
+        logger.info(f"Logging to: {tb_logger.log_dir}")
+        
+        return tb_logger
+    
+    def find_last_checkpoint(self) -> Optional[str]:
+        """
+        Find the last checkpoint in the experiment folder for resuming.
+        
+        Returns
+        -------
+            checkpoint_path : Optional[str]
+                Path to last.ckpt if found, None otherwise
+        """
+        exp_folder = Path(self.hparams.output_folder) / self.hparams.experiment_name
+        last_ckpt = exp_folder / "last.ckpt"
+        
+        if last_ckpt.exists():
+            logger.info(f"Found existing checkpoint for resuming: {last_ckpt}")
+            return str(last_ckpt)
+        
+        return None
+    
+    def fit(
+        self, 
+        datamodule: pl.LightningDataModule,
+        trainer: Optional[pl.Trainer] = None,
+        auto_resume: bool = True,
+        **trainer_kwargs
+    ):
+        """
+        Convenience method to train the model with automatic checkpoint handling.
+        
+        This method wraps Lightning's Trainer.fit() with built-in:
+        - Checkpoint callback setup
+        - Logger setup  
+        - Automatic resume from last checkpoint
+        - Experiment folder creation
+        
+        Arguments
+        ---------
+            datamodule : pl.LightningDataModule
+                Data module with train/val/test dataloaders
+            trainer : Optional[pl.Trainer]
+                Pre-configured trainer. If None, creates one from hparams.
+            auto_resume : bool
+                Whether to automatically resume from last checkpoint if found.
+                Default: True
+            **trainer_kwargs
+                Additional arguments passed to Trainer() if creating new one
+                
+        Returns
+        -------
+            trainer : pl.Trainer
+                The trainer used for fitting (useful for accessing callbacks/logs)
+        """
+        # Check if checkpointing is enabled
+        enable_checkpointing = getattr(
+            self.hparams, 'enable_checkpointing', True
+        )
+        
+        # Setup checkpoint callback if enabled
+        if enable_checkpointing and self._checkpoint_callback is None:
+            self._checkpoint_callback = self.setup_checkpoint_callback()
+        
+        # Find last checkpoint for resuming
+        ckpt_path = None
+        if auto_resume and enable_checkpointing:
+            ckpt_path = self.find_last_checkpoint()
+            
+            if ckpt_path:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"RESUMING TRAINING from checkpoint:")
+                logger.info(f"{ckpt_path}")
+                logger.info(f"{'='*60}\n")
+            else:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"STARTING NEW TRAINING")
+                logger.info(f"{'='*60}\n")
+        
+        # Create trainer if not provided
+        if trainer is None:
+            # Setup logger
+            tb_logger = self.setup_logger()
+            
+            # Collect callbacks
+            callbacks = []
+            if enable_checkpointing:
+                callbacks.append(self._checkpoint_callback)
+            
+            # Create trainer with defaults from hparams
+            trainer = pl.Trainer(
+                max_epochs=getattr(self.hparams, 'epochs', 100),
+                accelerator='auto',
+                devices='auto',
+                precision=getattr(self.hparams, 'precision', '32'),
+                callbacks=callbacks,
+                logger=tb_logger,
+                enable_progress_bar=True,
+                log_every_n_steps=50,
+                deterministic=False,
+                fast_dev_run=getattr(self.hparams, 'debug', False),
+                enable_checkpointing=enable_checkpointing,
+                num_sanity_val_steps=2,
+                **trainer_kwargs
+            )
+        
+        # Train the model
+        trainer.fit(self, datamodule=datamodule, ckpt_path=ckpt_path)
+        
+        self._trainer_configured = True
+        
+        return trainer
+    
+    def test(
+        self,
+        datamodule: pl.LightningDataModule,
+        trainer: Optional[pl.Trainer] = None,
+        ckpt_path: Optional[str] = "best",
+        **trainer_kwargs
+    ):
+        """
+        Convenience method to test the model.
+        
+        Arguments
+        ---------
+            datamodule : pl.LightningDataModule
+                Data module with test dataloader
+            trainer : Optional[pl.Trainer]
+                Pre-configured trainer. If None, creates one.
+            ckpt_path : Optional[str]
+                Checkpoint to load for testing. Options:
+                - "best": Load best checkpoint (default)
+                - "last": Load last checkpoint
+                - Path to specific checkpoint
+                - None: Use current model weights
+            **trainer_kwargs
+                Additional arguments passed to Trainer() if creating new one
+                
+        Returns
+        -------
+            results : List[Dict[str, float]]
+                Test results
+        """
+        # Resolve checkpoint path
+        if ckpt_path == "best" and self._checkpoint_callback is not None:
+            ckpt_path = self._checkpoint_callback.best_model_path
+            logger.info(f"Testing with best checkpoint: {ckpt_path}")
+        elif ckpt_path == "last":
+            ckpt_path = self.find_last_checkpoint()
+            logger.info(f"Testing with last checkpoint: {ckpt_path}")
+        
+        # Create trainer if not provided
+        if trainer is None:
+            trainer = pl.Trainer(
+                accelerator='auto',
+                devices='auto',
+                precision=getattr(self.hparams, 'precision', '32'),
+                enable_progress_bar=True,
+                logger=False,  # Don't need logger for testing
+                **trainer_kwargs
+            )
+        
+        # Test the model
+        results = trainer.test(self, datamodule=datamodule, ckpt_path=ckpt_path)
+        
+        return results
+    
     def set_input_shape(self, input_shape: Tuple):
         """
         Set input shape needed for export and MAC computation.
@@ -499,17 +726,20 @@ class MicroMind(pl.LightningModule):
         """
         self.input_shape = input_shape
 
-    def load_checkpoint(
+    def load_module_checkpoint(
         self, 
         checkpoint_path: Union[Path, str], 
         module_key: Optional[str] = None,
         strip_prefix: Optional[str] = None,
+        checkpoint_key: Optional[str] = None,
         strict: bool = True,
         map_location: str = "cpu"
     ):
         """
-        Flexible checkpoint loader. Can load full Lightning checkpoints, generic PyTorch 
-        state_dicts, or specific sub-modules with key remapping.
+        Flexible checkpoint loader for inference/fine-tuning.
+        
+        NOTE: For resuming training, use the fit() method with auto_resume=True.
+        This method only loads model weights, not optimizer/scheduler state.
 
         Arguments
         ---------
@@ -517,13 +747,12 @@ class MicroMind(pl.LightningModule):
                 Path to the checkpoint file.
             module_key : Optional[str]
                 If provided, loads the checkpoint ONLY into self.modules_dict[module_key].
-                If None, tries to load into the top-level LightningModule.
             strip_prefix : Optional[str]
                 If provided, strips this prefix from checkpoint keys before loading.
-                Useful when loading a sub-module that was saved as part of a larger model.
+            checkpoint_key : Optional[str]
+                Specific key in the loaded dictionary to extract the state_dict from.
             strict : bool
-                Whether to strictly enforce that the keys in state_dict match the keys 
-                returned by module's state_dict(). Default: True.
+                Whether to strictly enforce key matching. Default: True.
             map_location : str
                 Device mapping for loading. Default: "cpu".
         """
@@ -535,16 +764,41 @@ class MicroMind(pl.LightningModule):
             # Load the file
             loaded_obj = torch.load(checkpoint_path, map_location=map_location)
             
-            # 1. Unwrap Lightning Checkpoints or nested dictionaries
-            if isinstance(loaded_obj, dict) and 'state_dict' in loaded_obj:
-                state_dict = loaded_obj['state_dict']
+            state_dict = None
+
+            # Strategy: User specified key
+            if checkpoint_key is not None:
+                if isinstance(loaded_obj, dict) and checkpoint_key in loaded_obj:
+                    state_dict = loaded_obj[checkpoint_key]
+                else:
+                    raise KeyError(f"Key '{checkpoint_key}' not found in checkpoint.")
+
+            # Strategy: Auto-detect common keys
             elif isinstance(loaded_obj, dict):
-                state_dict = loaded_obj
+                # Common keys used in PyTorch/Lightning
+                for key in ['state_dict', 'model_state_dict', 'model']:
+                    if key in loaded_obj and isinstance(loaded_obj[key], (dict, Any)): 
+                        logger.info(f"Auto-detected state_dict at key '{key}'")
+                        state_dict = loaded_obj[key]
+                        break
+                
+                # If no known key found, assume the dict itself is the state_dict
+                if state_dict is None:
+                    # Heuristic: Check if keys look like parameters (contain dot or weight/bias)
+                    # to distinguish from a metadata dict
+                    sample_key = next(iter(loaded_obj))
+                    if 'epoch' in loaded_obj or 'optimizer' in loaded_obj:
+                        logger.warning(
+                            "Checkpoint seems to contain metadata but no known model key. "
+                            "Trying to load root dict, but this may fail."
+                        )
+                    state_dict = loaded_obj
+
+            # Strategy: loaded_obj is the state_dict or model itself
             else:
-                # Handle cases where the checkpoint is just the model object (rare but possible)
                 state_dict = loaded_obj.state_dict() if hasattr(loaded_obj, "state_dict") else loaded_obj
 
-            # 2. Target a specific module in modules_dict
+            # Target a specific module in modules_dict
             if module_key is not None:
                 if module_key not in self.modules_dict:
                     raise KeyError(f"Module '{module_key}' not found in modules_dict.")
@@ -555,37 +809,27 @@ class MicroMind(pl.LightningModule):
                 target_model = self
                 logger.info("Loading weights into full MicroMind model")
 
-            # 3. Handle Prefix Stripping / Key Remapping
-            # If we are loading into a specific module, we might need to fix keys.
+            # Handle Prefix Stripping / Key Remapping
             final_state_dict = {}
-            
             for k, v in state_dict.items():
                 new_key = k
-                
-                # Remove specific prefix if requested (e.g. "backbone.")
                 if strip_prefix and new_key.startswith(strip_prefix):
                     new_key = new_key[len(strip_prefix):]
                 
-                # If loading into a submodule, we often need to remove the wrapper prefix
-                # Example: Checkpoint has "modules_dict.backbone.layer1..."
-                #          Target (backbone) expects "layer1..."
                 if module_key:
-                    # Heuristic: if the key starts with the module name or typical wrappers, strip them
-                    # Check if key starts with "modules_dict.{module_key}."
                     wrapper_prefix = f"modules_dict.{module_key}."
                     if new_key.startswith(wrapper_prefix):
                         new_key = new_key[len(wrapper_prefix):]
                 
                 final_state_dict[new_key] = v
 
-            # 4. Load State Dict
+            # Load State Dict
             missing, unexpected = target_model.load_state_dict(final_state_dict, strict=strict)
             
-            # Logging results
             if len(missing) > 0:
-                logger.warning(f"Missing keys: {missing[:5]}{'...' if len(missing)>5 else ''}")
+                logger.warning(f"Missing keys: {missing[:5]}...")
             if len(unexpected) > 0:
-                logger.warning(f"Unexpected keys: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}")
+                logger.warning(f"Unexpected keys: {unexpected[:5]}...")
                 
             logger.info(f"Successfully loaded checkpoint from {checkpoint_path}")
 

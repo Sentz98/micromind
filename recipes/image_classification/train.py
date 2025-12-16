@@ -175,64 +175,40 @@ if __name__ == "__main__":
     assert len(sys.argv) > 1, "Please pass the configuration file to the script."
     hparams = parse_configuration(sys.argv[1])
 
-    # Create the LightningDataModule
+    # Optional: Set resource targets
+    # resources = {
+    #     "WM": 512 * 1024 * 1024,  # in bytes
+    #     "FLASH": hparams.target_FLASH,
+    #     "MACCs": hparams.target_MACCs,
+    # }
+
+    # Create the data module
     datamodule = ImageDataModule(hparams)
-
-    # Create experiment folder
-    exp_folder = mm.utils.checkpointer.create_experiment_folder(
-        hparams.output_folder, hparams.experiment_name
-    )
-
-    # Setup Lightning callbacks
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=exp_folder,
-        filename='{epoch}-{val_loss:.2f}',
-        monitor='val_loss',
-        mode='min',
-        save_top_k=3,
-        save_last=True,
-        verbose=True,
-    )
-
-    # Setup logger
-    tb_logger = TensorBoardLogger(
-        save_dir=hparams.output_folder,
-        name=hparams.experiment_name,
-    )
 
     # Initialize model
     mind = ImageClassification(hparams=hparams)
 
-    # Basic accuracy
+    # Add metrics (automatically tracked on train/val/test)
     mind.add_metric(
         'acc',
         Accuracy(task='multiclass', num_classes=hparams.num_classes),
         stage='all'
     )
 
-    # Create Lightning Trainer
-    trainer = pl.Trainer(
-        max_epochs=hparams.epochs,
-        accelerator='auto',  # Automatically selects GPU if available
-        devices='auto',      # Uses all available devices
-        precision=getattr(hparams, 'precision', '32'),  # Use 16-mixed for mixed precision
-        callbacks=[checkpoint_callback],
-        logger=tb_logger,
-        enable_progress_bar=True,
-        log_every_n_steps=50,
-        deterministic=False,
-        fast_dev_run=hparams.debug,  # Run only 1 batch if debug mode
+    trainer = mind.fit(
+        datamodule,
+        auto_resume=True,  # Automatically resume from last checkpoint
     )
 
-    # Train the model
-    trainer.fit(mind, datamodule=datamodule)
-
-    # Test the model
-    trainer.test(mind, datamodule=datamodule)
-
-    # Optional: Load best checkpoint and test
-    best_model = ImageClassification.load_from_checkpoint(
-        checkpoint_callback.best_model_path,
-        hparams=hparams
+    # Test using the best checkpoint
+    results = mind.test(
+        datamodule,
+        ckpt_path="best"  # Can also use "last" or path to specific checkpoint
     )
-    trainer.test(best_model, datamodule=datamodule)
+
+    print(f"\n{'='*60}")
+    print(f"Training complete!")
+    if mind._checkpoint_callback:
+        print(f"Best checkpoint: {mind._checkpoint_callback.best_model_path}")
+    print(f"Test results: {results}")
+    print(f"{'='*60}\n")

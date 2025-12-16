@@ -24,6 +24,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torchinfo",
+    "lightning",
     "huggingface_hub",
     "accelerate==0.23.0",
     "onnx",
